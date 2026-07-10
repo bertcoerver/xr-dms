@@ -22,6 +22,8 @@ dependencies = [
     "pandas",
     "xarray",
     "scipy",
+    "dask",
+    "scikit-learn",
 ]
 
 [project.optional-dependencies]

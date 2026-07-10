@@ -1,0 +1,26 @@
+{
+  "files": [
+    "run_pyDMS.py",
+    "LICENSE",
+    "Makefile",
+    "pyproject.toml",
+    "README.md",
+    ".gitignore",
+    "tag_release.sh",
+    "tests/test_basic.py",
+    "tests/__init__.py",
+    "examples/dms_explained.ipynb",
+    "examples/highres_features.npy",
+    "examples/dms_explained_numpy.py",
+    "examples/__init__.py",
+    "examples/lowres_target.npy",
+    "examples/dms_explained_numpy.png",
+    ".github/workflows/publish.yml",
+    ".github/workflows/docs.yml",
+    ".github/workflows/tests.yml",
+    "src/xr_dms/__init__.py",
+    "src/pyDMS/pyDMSUtils.py",
+    "src/pyDMS/__init__.py",
+    "src/pyDMS/pyDMS.py"
+  ]
+}

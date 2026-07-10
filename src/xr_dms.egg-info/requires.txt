@@ -1,0 +1,13 @@
+numpy
+pandas
+xarray
+scipy
+dask
+scikit-learn
+
+[dev]
+pytest>=7.0
+pytest-cov>=4.0
+pytest-xdist>=3.0
+ipython>=8.0
+ipykernel>=6.0

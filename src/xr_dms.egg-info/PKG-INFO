@@ -1,0 +1,47 @@
+Metadata-Version: 2.4
+Name: xr_dms
+Version: 0.1.dev74+g137f0f9ec.d20260710
+Summary: A lazy, chunked implementation of the Data Mining Sharpener
+Author-email: Bert Coerver <b.coerver@mailbox.org>
+License-Expression: MIT
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: xarray
+Requires-Dist: scipy
+Requires-Dist: dask
+Requires-Dist: scikit-learn
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0; extra == "dev"
+Requires-Dist: pytest-xdist>=3.0; extra == "dev"
+Requires-Dist: ipython>=8.0; extra == "dev"
+Requires-Dist: ipykernel>=6.0; extra == "dev"
+Dynamic: license-file
+
+# xr_dms
+
+A lazy, chunked implementation of the Data Mining Sharpener
+
+## Installation
+
+```bash
+pip install xr_dms
+```
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+## Release
+
+```bash
+./tag_release.sh patch   # or minor / major
+```
