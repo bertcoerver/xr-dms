@@ -16,6 +16,7 @@ regression trees, each tree fitting a per-leaf Ridge regression
 
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -47,6 +48,21 @@ class BaseRegressor(ABC):
     @abstractmethod
     def predict(self, X) -> np.ndarray:
         """Predict for ``X`` (``n_samples, n_features``) -> ``(n_samples,)``."""
+
+    def clone(self, local: bool = False) -> "BaseRegressor":
+        """Return a fresh, *unfitted* copy of this backend.
+
+        The sharpener clones its regressor template once per model (the global
+        model and, in moving-window mode, one per window) before fitting, so a
+        backend must never share fitted state between clones. The default
+        deep-copies ``self``; because cloning always happens *before* ``fit``,
+        this is safe for any subclass whose constructor stores only
+        hyperparameters. ``local`` signals that the clone will be trained on a
+        small local (moving-window) sample -- backends may regularise more
+        tightly in that case (see :meth:`SklearnDMSRegressor.clone`); the
+        default ignores it.
+        """
+        return copy.deepcopy(self)
 
 
 class DecisionTreeRegressorWithLinearLeafRegression(tree.DecisionTreeRegressor):
@@ -160,6 +176,24 @@ class SklearnDMSRegressor(BaseRegressor):
         self.regressor_opt = dict(regressor_opt or {})
         self.bagging_opt = dict(bagging_opt or {})
         self._model = None
+
+    def clone(self, local: bool = False) -> "SklearnDMSRegressor":
+        """Return a fresh, unfitted regressor with the same hyperparameters.
+
+        ``local=True`` sets the :attr:`local` flag so :meth:`fit` uses the
+        tighter ``max_leaf_nodes`` (10 vs 30) appropriate for the small training
+        sets of a moving-window model (pyDMS section 2.3).
+        """
+        return SklearnDMSRegressor(
+            local=local,
+            per_leaf_linear_regression=self.per_leaf_linear_regression,
+            linear_regression_extrapolation_ratio=(
+                self.linear_regression_extrapolation_ratio
+            ),
+            min_samples_number=self.min_samples_number,
+            regressor_opt=self.regressor_opt,
+            bagging_opt=self.bagging_opt,
+        )
 
     def fit(self, X, y, sample_weight=None):
         X = np.asarray(X, dtype=float)

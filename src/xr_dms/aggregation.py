@@ -19,6 +19,7 @@ __all__ = [
     "homogeneity_cv",
     "upsample",
     "binomial_smooth",
+    "window_basis_1d",
 ]
 
 # Small constant that guards divisions by (near-)zero means / std.
@@ -160,3 +161,61 @@ def binomial_smooth(coarse, x_dim="x", y_dim="y"):
     for dim in (y_dim, x_dim):
         values = correlate1d(values, weights, axis=axes[dim], mode="nearest")
     return coarse.copy(data=values)
+
+
+def window_basis_1d(coords, centers, edges, smooth):
+    """Per-window 1-D blending weights for a moving-window sharpener.
+
+    Returns a ``(n_windows, n_coords)`` matrix giving, along a single spatial
+    axis, how much each window contributes to each fine coordinate. The 2-D
+    window weight field used by the local prediction is the outer product of the
+    y- and x-axis results, so the blend stays separable and cheap.
+
+    Parameters
+    ----------
+    coords : array-like, shape (n_coords,)
+        Fine pixel-centre coordinates along the axis (any orientation).
+    centers : array-like, shape (n_windows,)
+        Coordinate of each window prediction cell's centre along the axis.
+    edges : array-like, shape (n_windows, 2)
+        ``[lo, hi]`` bounds (``lo < hi``) of each window's prediction cell; the
+        outermost bounds should be ``-inf``/``+inf`` so the cells partition the
+        whole axis. Used only when ``smooth`` is ``False``.
+    smooth : bool
+        ``True``: piecewise-linear ("tent") basis over ``centers`` -- a partition
+        of unity that interpolates linearly between neighbouring window centres
+        and clamps to the nearest window past the end centres, giving a
+        C0-continuous (seamless) local field. ``False``: hard indicator of
+        ``coords`` falling inside each window's ``edges`` (nearest / blocky).
+
+    Returns
+    -------
+    numpy.ndarray, shape (n_windows, n_coords)
+        Non-negative weights. For ``smooth`` they sum to 1 across windows at
+        every coordinate; for the hard case exactly one window is 1 per
+        coordinate.
+    """
+    coords = np.asarray(coords, dtype=float)
+    centers = np.asarray(centers, dtype=float)
+    n_win = centers.shape[0]
+
+    if not smooth:
+        edges = np.asarray(edges, dtype=float)
+        lo = edges[:, 0][:, None]
+        hi = edges[:, 1][:, None]
+        return ((coords[None, :] >= lo) & (coords[None, :] < hi)).astype(float)
+
+    # Piecewise-linear basis. np.interp needs ascending sample points, so work in
+    # the sorted-centre order and scatter the rows back to the original order.
+    order = np.argsort(centers)
+    cs = centers[order]
+    basis_sorted = np.empty((n_win, coords.shape[0]), dtype=float)
+    for k in range(n_win):
+        unit = np.zeros(n_win, dtype=float)
+        unit[k] = 1.0
+        # np.interp clamps to the end values outside [cs[0], cs[-1]], which is
+        # exactly the "nearest window past the ends" behaviour we want.
+        basis_sorted[k] = np.interp(coords, cs, unit)
+    basis = np.empty_like(basis_sorted)
+    basis[order] = basis_sorted
+    return basis

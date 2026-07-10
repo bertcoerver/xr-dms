@@ -29,6 +29,7 @@ from .aggregation import (
     homogeneity_cv,
     infer_factor,
     upsample,
+    window_basis_1d,
 )
 from .regressors import BaseRegressor, SklearnDMSRegressor
 
@@ -80,6 +81,28 @@ class Sharpener:
         *exactly* mass-conserving -- re-aggregating the sharpened result
         reproduces ``target`` -- at the cost of faint block edges in the
         correction.
+    window_size : int, default 0
+        Side length, in *coarse* pixels, of the moving-window local regression
+        of Gao (2012) section 2.3. ``0`` (the default) trains only the single
+        global model -- the classic pipeline. When ``> 0`` the coarse scene is
+        tiled into windows; one local model is trained per window (on the
+        homogeneous pixels of an enlarged, overlapping *sampling* extent) in
+        addition to the global model, and the two are combined by
+        inverse-residual weights (see :meth:`sharpen`). Local models capture
+        feature->LST relationships that vary across a large heterogeneous scene.
+    window_extension : float, default 0.25
+        Fraction of ``window_size`` by which each window's *sampling* extent is
+        grown on every side beyond its *prediction* cell, so neighbouring local
+        models share training pixels and agree across window boundaries.
+    smooth_local : bool, default True
+        How per-window local models are combined spatially. ``True``: each fine
+        pixel is a piecewise-linear ("tent") blend of the surrounding window
+        models -- C0-continuous and seamless by construction. ``False``: hard,
+        non-overlapping window cells (faithful pyDMS), with the window seams left
+        for the local/global residual blend to soften.
+    min_training_samples : int, default 10
+        Minimum number of homogeneous pixels a window must contribute to get its
+        own local model; windows below this fall back to the global model.
     boundary : {"exact", "trim"}, default "exact"
         Coarsening boundary policy (see :func:`~xr_dms.aggregation.infer_factor`).
     x_dim, y_dim : str, default "x", "y"
@@ -90,6 +113,8 @@ class Sharpener:
 
     def __init__(self, regressor=None, cv_percentile=80,
                  disaggregating_temperature=False, smooth_residual=True,
+                 window_size=0, window_extension=0.25, smooth_local=True,
+                 min_training_samples=10,
                  boundary="exact", x_dim="x", y_dim="y", band_dim="band"):
         self.regressor = regressor if regressor is not None else SklearnDMSRegressor()
         if not isinstance(self.regressor, BaseRegressor):
@@ -97,6 +122,10 @@ class Sharpener:
         self.cv_percentile = cv_percentile
         self.disaggregating_temperature = disaggregating_temperature
         self.smooth_residual = smooth_residual
+        self.window_size = int(window_size)
+        self.window_extension = window_extension
+        self.smooth_local = smooth_local
+        self.min_training_samples = int(min_training_samples)
         self.boundary = boundary
         self.x_dim = x_dim
         self.y_dim = y_dim
@@ -106,6 +135,13 @@ class Sharpener:
         self.factor_ = None
         self.band_order_ = None
         self.fitted_ = False
+        self.global_model_ = None
+        # Moving-window state (populated by fit when window_size > 0).
+        self.local_models_ = None
+        self.window_centers_x_ = None
+        self.window_centers_y_ = None
+        self.window_edges_x_ = None
+        self.window_edges_y_ = None
 
     # -- input normalisation -------------------------------------------------
     def _as_features(self, features):
@@ -142,8 +178,40 @@ class Sharpener:
         return coarse.assign_coords(assign) if assign else coarse
 
     # -- STEP 1-3: training --------------------------------------------------
+    def _fit_region(self, mean_arr, y_arr, cv_arr, rows, cols, local, min_samples):
+        """Fit one model on a rectangular sub-region of the coarse grid.
+
+        ``mean_arr`` is ``(ny, nx, n_bands)``; ``y_arr`` and ``cv_arr`` are
+        ``(ny, nx)``. Homogeneous pixels (CV at or below the ``cv_percentile``
+        percentile *within this region*) are used as training samples, weighted
+        by ``1 / (cv + eps)``. Returns ``(model, cv_threshold, n_samples)`` or
+        ``None`` if fewer than ``min_samples`` homogeneous pixels are available.
+        """
+        X = mean_arr[rows, cols, :].reshape(-1, mean_arr.shape[-1])
+        y = y_arr[rows, cols].reshape(-1)
+        cv = cv_arr[rows, cols].reshape(-1)
+
+        finite = np.isfinite(y) & np.isfinite(cv) & np.all(np.isfinite(X), axis=1)
+        if finite.sum() < min_samples:
+            return None
+
+        cv_valid = cv[finite]
+        threshold = np.percentile(cv_valid, self.cv_percentile)
+        homogeneous = finite.copy()
+        homogeneous[finite] = cv_valid <= threshold
+        if homogeneous.sum() < min_samples:
+            return None
+
+        weights = 1.0 / (cv[homogeneous] + EPS)
+        model = self.regressor.clone(local=local)
+        model.fit(X[homogeneous], y[homogeneous], sample_weight=weights)
+        return model, float(threshold), int(homogeneous.sum())
+
     def fit(self, features, target):
         """Train the regressor on homogeneous coarse pixels (steps 1-3).
+
+        Always trains the global model. When ``window_size > 0`` it additionally
+        trains one local model per moving window (Gao 2012 section 2.3).
 
         Parameters
         ----------
@@ -171,32 +239,75 @@ class Sharpener:
         cv = homogeneity_cv(mean, std, self.band_dim)
 
         # Bring the (small) coarse training arrays into memory.
-        # X: (n_pixels, n_bands) with band as the last axis.
-        X = mean.transpose(self.y_dim, self.x_dim, self.band_dim).values
-        X = X.reshape(-1, X.shape[-1])
-        y = np.asarray(target.transpose(self.y_dim, self.x_dim).values).reshape(-1)
-        cv_flat = np.asarray(cv.transpose(self.y_dim, self.x_dim).values).reshape(-1)
+        # mean_arr: (ny, nx, n_bands) with band as the last axis.
+        mean_arr = mean.transpose(self.y_dim, self.x_dim, self.band_dim).values
+        y_arr = np.asarray(target.transpose(self.y_dim, self.x_dim).values)
+        cv_arr = np.asarray(cv.transpose(self.y_dim, self.x_dim).values)
+        ny, nx = y_arr.shape
+        full = (slice(None), slice(None))
 
-        finite = np.isfinite(y) & np.isfinite(cv_flat) & np.all(np.isfinite(X), axis=1)
-        if not finite.any():
-            raise ValueError("No finite training pixels available.")
+        # -- global model (whole scene) --
+        result = self._fit_region(mean_arr, y_arr, cv_arr, *full, local=False,
+                                   min_samples=1)
+        if result is None:
+            raise ValueError(
+                "No homogeneous training pixels available for the global model."
+            )
+        self.global_model_, self.cv_threshold_, self.n_training_samples_ = result
 
-        cv_valid = cv_flat[finite]
-        threshold = np.percentile(cv_valid, self.cv_percentile)
-        homogeneous = finite.copy()
-        homogeneous[finite] = cv_valid <= threshold
-        if homogeneous.sum() == 0:
-            raise ValueError("No homogeneous training pixels below CV threshold.")
+        # -- local (moving-window) models --
+        self.local_models_ = None
+        if self.window_size > 0:
+            self._train_local_models(mean_arr, y_arr, cv_arr, fine)
 
-        X_train = X[homogeneous]
-        y_train = y[homogeneous]
-        weights = 1.0 / (cv_flat[homogeneous] + EPS)
-
-        self.regressor.fit(X_train, y_train, sample_weight=weights)
-        self.cv_threshold_ = float(threshold)
-        self.n_training_samples_ = int(homogeneous.sum())
         self.fitted_ = True
         return self
+
+    def _train_local_models(self, mean_arr, y_arr, cv_arr, fine):
+        """Tile the coarse grid into windows and fit one local model each."""
+        ny, nx = y_arr.shape
+        w = self.window_size
+        f = self.factor_
+        ext = int(round(self.window_extension * w))
+        n_wy = int(np.ceil(ny / w))
+        n_wx = int(np.ceil(nx / w))
+
+        fx = np.asarray(fine[self.x_dim].values, dtype=float)
+        fy = np.asarray(fine[self.y_dim].values, dtype=float)
+
+        def axis_geometry(n_win, n_coarse, coord):
+            """Per-window prediction-cell centres and edges in fine coords."""
+            centers = np.empty(n_win, dtype=float)
+            edges = np.empty((n_win, 2), dtype=float)
+            for i in range(n_win):
+                lo_c = i * w
+                hi_c = min((i + 1) * w, n_coarse)
+                lo_f = lo_c * f
+                hi_f = hi_c * f  # exclusive fine index
+                centers[i] = coord[lo_f:hi_f].mean()
+                lo_edge = -np.inf if i == 0 else 0.5 * (coord[lo_f - 1] + coord[lo_f])
+                hi_edge = (
+                    np.inf if hi_c >= n_coarse
+                    else 0.5 * (coord[hi_f - 1] + coord[hi_f])
+                )
+                edges[i] = (min(lo_edge, hi_edge), max(lo_edge, hi_edge))
+            return centers, edges
+
+        self.window_centers_y_, self.window_edges_y_ = axis_geometry(n_wy, ny, fy)
+        self.window_centers_x_, self.window_edges_x_ = axis_geometry(n_wx, nx, fx)
+
+        models = [[None] * n_wx for _ in range(n_wy)]
+        for iy in range(n_wy):
+            rows = slice(max(iy * w - ext, 0), min((iy + 1) * w + ext, ny))
+            for ix in range(n_wx):
+                cols = slice(max(ix * w - ext, 0), min((ix + 1) * w + ext, nx))
+                result = self._fit_region(
+                    mean_arr, y_arr, cv_arr, rows, cols,
+                    local=True, min_samples=self.min_training_samples,
+                )
+                if result is not None:
+                    models[iy][ix] = result[0]
+        self.local_models_ = models
 
     # -- STEP 4: apply to fine features -> first guess -----------------------
     def predict(self, features):
@@ -212,7 +323,7 @@ class Sharpener:
         # Reorder bands to the training order so feature columns line up.
         fine = fine.sel({self.band_dim: self.band_order_})
 
-        regressor = self.regressor
+        regressor = self.global_model_
 
         def _predict_block(arr):
             # arr has band as the last axis: (..., n_bands).
@@ -234,6 +345,143 @@ class Sharpener:
             output_dtypes=[float],
         )
         return first_guess.rename("first_guess")
+
+    # -- STEP 4 (local): moving-window first guess ---------------------------
+    def _has_local_models(self):
+        return self.local_models_ is not None and any(
+            m is not None for row in self.local_models_ for m in row
+        )
+
+    def predict_local(self, features):
+        """Apply the moving-window local models to the fine features.
+
+        Returns a lazy fine-resolution first guess blended from the per-window
+        local models. With ``smooth_local=True`` each pixel is a piecewise-linear
+        blend of the surrounding window models (seamless); with
+        ``smooth_local=False`` each pixel takes its containing window's model
+        (hard cells). Pixels not covered by any fitted window model are ``NaN``
+        (the local/global blend falls back to the global model there).
+
+        The blend uses only the *global* window geometry captured at
+        :meth:`fit`, so the result is independent of how ``features`` is chunked
+        (each dask block is computed the same way) and stays dask-backed when the
+        input is.
+        """
+        if not self.fitted_:
+            raise RuntimeError("Sharpener.predict_local called before fit.")
+        if not self._has_local_models():
+            raise RuntimeError(
+                "predict_local requires window_size > 0 and fitted local models."
+            )
+        fine = self._as_features(features).sel({self.band_dim: self.band_order_})
+        fine = fine.transpose(self.band_dim, self.y_dim, self.x_dim)
+        if fine.chunks is not None:
+            # A single band chunk keeps every feature together within each block.
+            fine = fine.chunk({self.band_dim: -1})
+
+        models = self.local_models_
+        n_wy = len(models)
+        n_wx = len(models[0])
+        centers_y = self.window_centers_y_
+        centers_x = self.window_centers_x_
+        edges_y = self.window_edges_y_
+        edges_x = self.window_edges_x_
+        smooth = self.smooth_local
+        y_dim, x_dim, band_dim = self.y_dim, self.x_dim, self.band_dim
+
+        def _local_block(block):
+            b = block.transpose(band_dim, y_dim, x_dim)
+            yc = np.asarray(b[y_dim].values, dtype=float)
+            xc = np.asarray(b[x_dim].values, dtype=float)
+            arr = np.asarray(b.values, dtype=float)  # (n_bands, ny, nx)
+            n_bands, nyb, nxb = arr.shape
+            by = window_basis_1d(yc, centers_y, edges_y, smooth)  # (n_wy, nyb)
+            bx = window_basis_1d(xc, centers_x, edges_x, smooth)  # (n_wx, nxb)
+
+            feat = arr.reshape(n_bands, -1).T  # (npix, n_bands)
+            valid = np.all(np.isfinite(feat), axis=1)
+
+            acc = np.zeros((nyb, nxb), dtype=float)
+            wsum = np.zeros((nyb, nxb), dtype=float)
+            pred_cache = {}
+            for iy in range(n_wy):
+                wy = by[iy]
+                if not wy.any():
+                    continue
+                for ix in range(n_wx):
+                    model = models[iy][ix]
+                    if model is None:
+                        continue
+                    wx = bx[ix]
+                    if not wx.any():
+                        continue
+                    weight = np.outer(wy, wx)
+                    mask = weight > 0
+                    if not mask.any():
+                        continue
+                    if (iy, ix) not in pred_cache:
+                        pred = np.full(feat.shape[0], np.nan, dtype=float)
+                        if valid.any():
+                            pred[valid] = model.predict(feat[valid])
+                        pred_cache[(iy, ix)] = pred.reshape(nyb, nxb)
+                    pred2d = pred_cache[(iy, ix)]
+                    use = mask & np.isfinite(pred2d)
+                    acc[use] += weight[use] * pred2d[use]
+                    wsum[use] += weight[use]
+
+            out = np.divide(
+                acc, wsum, out=np.full_like(acc, np.nan), where=wsum > 0
+            )
+            return xr.DataArray(
+                out, dims=(y_dim, x_dim),
+                coords={y_dim: b[y_dim], x_dim: b[x_dim]},
+            )
+
+        template = fine.isel({band_dim: 0}, drop=True).astype(float)
+        local_guess = xr.map_blocks(_local_block, fine, template=template)
+        return local_guess.rename("local_first_guess")
+
+    def _blend_local_global(self, local_fg, global_fg, target):
+        """Combine local and global first guesses by inverse-residual weights.
+
+        Following pyDMS section 2.3: each first guess is aggregated back to the
+        coarse grid, its absolute residual against ``target`` computed, and the
+        two blended with weights ``(1/r)**2`` (so the guess that better matches
+        the coarse observation locally dominates). Where the local model has no
+        prediction (``NaN``) the global guess is used.
+        """
+        radiance = self.disaggregating_temperature
+
+        def to_coarse(fg):
+            r = to_radiance(fg) if radiance else fg
+            c = r.coarsen(
+                {self.y_dim: self.factor_, self.x_dim: self.factor_},
+                boundary=self.boundary,
+            ).mean()
+            return self._match_coarse_coords(c, target)
+
+        obs = to_radiance(target) if radiance else target
+        res_local = np.abs(obs - to_coarse(local_fg))
+        res_global = np.abs(obs - to_coarse(global_fg))
+
+        wl = 1.0 / (res_local + EPS) ** 2
+        wg = 1.0 / (res_global + EPS) ** 2
+        ww = wl / (wl + wg)
+        # Where the local guess is missing, res_local is NaN -> lean fully global.
+        ww = ww.where(np.isfinite(ww), 0.0).clip(0.0, 1.0).compute()
+
+        ww_fine = upsample(ww, local_fg, self.x_dim, self.y_dim, method="linear")
+        ww_fine = ww_fine.clip(0.0, 1.0)
+        fw_fine = 1.0 - ww_fine
+
+        local_filled = local_fg.where(np.isfinite(local_fg), global_fg)
+        if radiance:
+            blended = from_radiance(
+                to_radiance(local_filled) * ww_fine + to_radiance(global_fg) * fw_fine
+            )
+        else:
+            blended = local_filled * ww_fine + global_fg * fw_fine
+        return blended.rename("first_guess")
 
     # -- STEP 5: residual correction -----------------------------------------
     def residual_correct(self, first_guess, target):
@@ -274,11 +522,25 @@ class Sharpener:
         return corrected.rename("sharpened")
 
     # -- convenience ---------------------------------------------------------
+    def first_guess(self, features, target):
+        """Model-based fine first guess (steps 1-4), before residual correction.
+
+        The global model first guess, or -- when local models were fitted --  the
+        inverse-residual blend of the local and global first guesses. Requires a
+        prior :meth:`fit`.
+        """
+        global_fg = self.predict(features)
+        if self.window_size > 0 and self._has_local_models():
+            local_fg = self.predict_local(features)
+            return self._blend_local_global(local_fg, global_fg, target)
+        return global_fg
+
     def sharpen(self, features, target):
         """Fit, predict and residual-correct in one call (steps 1-5).
 
-        Returns the lazy sharpened fine-resolution :class:`xarray.DataArray`.
+        With ``window_size > 0`` the local and global first guesses are blended
+        (Gao 2012 section 2.3) before the residual correction. Returns the lazy
+        sharpened fine-resolution :class:`xarray.DataArray`.
         """
         self.fit(features, target)
-        first_guess = self.predict(features)
-        return self.residual_correct(first_guess, target)
+        return self.residual_correct(self.first_guess(features, target), target)
