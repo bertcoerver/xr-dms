@@ -6,6 +6,11 @@ These functions replace the GDAL resampling primitives used by the reference
 :func:`infer_factor`), so aggregation is a plain block reduction
 (:meth:`xarray.DataArray.coarsen`) rather than a reprojecting warp. Everything
 is lazy-friendly: ``coarsen`` and ``interp`` preserve dask backing.
+
+They are the machinery behind :class:`~xr_dms.RegularGridMap`; a pairing that is
+*not* co-registered -- a curvilinear swath over a projected grid -- goes through
+:class:`~xr_dms.SwathGridMap` instead. :func:`homogeneity_cv` and
+:func:`binomial_smooth` are grid-agnostic and serve both.
 """
 
 from __future__ import annotations

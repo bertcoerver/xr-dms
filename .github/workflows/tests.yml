@@ -10,7 +10,8 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+        # Matches requires-python in pyproject.toml.
+        python-version: ['3.13']
 
     steps:
       - uses: actions/checkout@v3
@@ -24,8 +25,11 @@ jobs:
           activate-environment: test-env
           use-mamba: true 
 
-      - name: Install GDAL via Conda
-        run: conda run -n test-env conda install -y -c conda-forge gdal
+      # pyresample's pip wheel vendors its own libomp via pykdtree, which clashes
+      # with the OpenMP runtime a conda environment already has and aborts the
+      # KD-tree search. Take both from conda-forge so they share one runtime.
+      - name: Install pyresample via Conda
+        run: conda run -n test-env conda install -y -c conda-forge pyresample pykdtree
 
       - name: Install package dependencies
         run: conda run -n test-env pip install -e .[test]

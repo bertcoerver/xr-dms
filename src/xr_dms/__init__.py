@@ -3,6 +3,8 @@
 from importlib.metadata import version, PackageNotFoundError
 
 from .sharpener import Sharpener, to_radiance, from_radiance
+from .gridmap import GridMap, RegularGridMap
+from .geo import SwathGridMap
 from .regressors import (
     BaseRegressor,
     DecisionTreeRegressorWithLinearLeafRegression,
@@ -16,6 +18,9 @@ except PackageNotFoundError:
 
 __all__ = [
     "Sharpener",
+    "GridMap",
+    "RegularGridMap",
+    "SwathGridMap",
     "BaseRegressor",
     "DecisionTreeRegressorWithLinearLeafRegression",
     "SklearnDMSRegressor",

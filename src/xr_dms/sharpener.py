@@ -25,12 +25,9 @@ import xarray as xr
 from .aggregation import (
     EPS,
     binomial_smooth,
-    coarsen_mean_std,
     homogeneity_cv,
-    infer_factor,
-    upsample,
-    window_basis_1d,
 )
+from .gridmap import RegularGridMap
 from .regressors import BaseRegressor, SklearnDMSRegressor
 
 __all__ = ["Sharpener", "to_radiance", "from_radiance"]
@@ -103,6 +100,12 @@ class Sharpener:
     min_training_samples : int, default 10
         Minimum number of homogeneous pixels a window must contribute to get its
         own local model; windows below this fall back to the global model.
+    grid_map : GridMap, optional
+        How the fine and coarse grids relate. Defaults to a
+        :class:`~xr_dms.RegularGridMap` inferred from the two objects' shapes --
+        the classic co-registered, integer-factor case. Pass a
+        :class:`~xr_dms.SwathGridMap` to sharpen a curvilinear swath onto a
+        projected grid, where no integer factor exists.
     boundary : {"exact", "trim"}, default "exact"
         Coarsening boundary policy (see :func:`~xr_dms.aggregation.infer_factor`).
     x_dim, y_dim : str, default "x", "y"
@@ -114,7 +117,7 @@ class Sharpener:
     def __init__(self, regressor=None, cv_percentile=80,
                  disaggregating_temperature=False, smooth_residual=True,
                  window_size=0, window_extension=0.25, smooth_local=True,
-                 min_training_samples=10,
+                 min_training_samples=10, grid_map=None,
                  boundary="exact", x_dim="x", y_dim="y", band_dim="band"):
         self.regressor = regressor if regressor is not None else SklearnDMSRegressor()
         if not isinstance(self.regressor, BaseRegressor):
@@ -126,22 +129,21 @@ class Sharpener:
         self.window_extension = window_extension
         self.smooth_local = smooth_local
         self.min_training_samples = int(min_training_samples)
+        self.grid_map = grid_map
         self.boundary = boundary
         self.x_dim = x_dim
         self.y_dim = y_dim
         self.band_dim = band_dim
 
         # Populated by fit().
+        self.grid_map_ = None
         self.factor_ = None
         self.band_order_ = None
         self.fitted_ = False
         self.global_model_ = None
         # Moving-window state (populated by fit when window_size > 0).
         self.local_models_ = None
-        self.window_centers_x_ = None
-        self.window_centers_y_ = None
-        self.window_edges_x_ = None
-        self.window_edges_y_ = None
+        self.window_basis_ = None
 
     # -- input normalisation -------------------------------------------------
     def _as_features(self, features):
@@ -151,31 +153,32 @@ class Sharpener:
         elif isinstance(features, xr.DataArray):
             da = features
             if self.band_dim not in da.dims:
-                da = da.expand_dims(self.band_dim)
+                # A bare 2-D field is a single feature. Give the new dimension a
+                # label as well, since predict() selects bands by name.
+                name = da.name if da.name is not None else "feature"
+                da = da.expand_dims(self.band_dim).assign_coords(
+                    {self.band_dim: [str(name)]}
+                )
         else:
             raise TypeError("features must be an xarray DataArray or Dataset.")
+
+        extra = [
+            d for d in da.dims
+            if d not in (self.band_dim, self.y_dim, self.x_dim)
+        ]
+        if extra:
+            raise ValueError(
+                f"features has unexpected dimension(s) {extra}; the sharpener "
+                f"handles a single {self.band_dim}/{self.y_dim}/{self.x_dim} scene. "
+                "Select one step first, e.g. features.isel(time=0)."
+            )
+        da = da.transpose(self.band_dim, self.y_dim, self.x_dim)
+        if da.chunks is not None:
+            # The regressor consumes all features of a pixel at once, so band is a
+            # core dimension and must live in a single chunk. Converting a chunked
+            # Dataset gives one band chunk per variable, so this is not optional.
+            da = da.chunk({self.band_dim: -1})
         return da
-
-    def _match_coarse_coords(self, coarse, target):
-        """Assign ``target``'s spatial coords onto a coarsened array.
-
-        Block-averaged coordinates from :meth:`~xarray.DataArray.coarsen` are the
-        block centres, which equal the coarse pixel coordinates only up to
-        floating-point noise. Overwriting them positionally lets xarray align the
-        coarse arrays with the target without spurious NaNs.
-        """
-        for dim in (self.y_dim, self.x_dim):
-            if coarse.sizes[dim] != target.sizes[dim]:
-                raise ValueError(
-                    f"Coarsened size {coarse.sizes[dim]} along {dim!r} does not "
-                    f"match target size {target.sizes[dim]}. Check the grids are "
-                    "co-registered and the factor is correct."
-                )
-        assign = {}
-        for dim in (self.y_dim, self.x_dim):
-            if dim in target.coords:
-                assign[dim] = target[dim].values
-        return coarse.assign_coords(assign) if assign else coarse
 
     # -- STEP 1-3: training --------------------------------------------------
     def _fit_region(self, mean_arr, y_arr, cv_arr, rows, cols, local, min_samples):
@@ -227,23 +230,24 @@ class Sharpener:
         """
         fine = self._as_features(features)
         self.band_order_ = [str(b) for b in fine[self.band_dim].values]
-        self.factor_ = infer_factor(
-            fine, target, self.x_dim, self.y_dim, self.boundary
-        )
 
-        mean, std = coarsen_mean_std(
-            fine, self.factor_, self.x_dim, self.y_dim, self.boundary
+        self.grid_map_ = self.grid_map if self.grid_map is not None else (
+            RegularGridMap.from_grids(
+                fine, target, self.x_dim, self.y_dim, self.boundary
+            )
         )
-        mean = self._match_coarse_coords(mean, target)
-        std = self._match_coarse_coords(std, target)
+        self.factor_ = getattr(self.grid_map_, "factor", None)
+        cy, cx = self.grid_map_.coarse_dims
+        target = self.grid_map_.prepare_target(target)
+
+        mean, std = self.grid_map_.aggregate(fine, self.band_dim)
         cv = homogeneity_cv(mean, std, self.band_dim)
 
         # Bring the (small) coarse training arrays into memory.
         # mean_arr: (ny, nx, n_bands) with band as the last axis.
-        mean_arr = mean.transpose(self.y_dim, self.x_dim, self.band_dim).values
-        y_arr = np.asarray(target.transpose(self.y_dim, self.x_dim).values)
-        cv_arr = np.asarray(cv.transpose(self.y_dim, self.x_dim).values)
-        ny, nx = y_arr.shape
+        mean_arr = mean.transpose(cy, cx, self.band_dim).values
+        y_arr = np.asarray(target.transpose(cy, cx).values)
+        cv_arr = np.asarray(cv.transpose(cy, cx).values)
         full = (slice(None), slice(None))
 
         # -- global model (whole scene) --
@@ -267,34 +271,15 @@ class Sharpener:
         """Tile the coarse grid into windows and fit one local model each."""
         ny, nx = y_arr.shape
         w = self.window_size
-        f = self.factor_
         ext = int(round(self.window_extension * w))
         n_wy = int(np.ceil(ny / w))
         n_wx = int(np.ceil(nx / w))
 
-        fx = np.asarray(fine[self.x_dim].values, dtype=float)
-        fy = np.asarray(fine[self.y_dim].values, dtype=float)
-
-        def axis_geometry(n_win, n_coarse, coord):
-            """Per-window prediction-cell centres and edges in fine coords."""
-            centers = np.empty(n_win, dtype=float)
-            edges = np.empty((n_win, 2), dtype=float)
-            for i in range(n_win):
-                lo_c = i * w
-                hi_c = min((i + 1) * w, n_coarse)
-                lo_f = lo_c * f
-                hi_f = hi_c * f  # exclusive fine index
-                centers[i] = coord[lo_f:hi_f].mean()
-                lo_edge = -np.inf if i == 0 else 0.5 * (coord[lo_f - 1] + coord[lo_f])
-                hi_edge = (
-                    np.inf if hi_c >= n_coarse
-                    else 0.5 * (coord[hi_f - 1] + coord[hi_f])
-                )
-                edges[i] = (min(lo_edge, hi_edge), max(lo_edge, hi_edge))
-            return centers, edges
-
-        self.window_centers_y_, self.window_edges_y_ = axis_geometry(n_wy, ny, fy)
-        self.window_centers_x_, self.window_edges_x_ = axis_geometry(n_wx, nx, fx)
+        # The spatial blend basis is the grid map's business: a separable tent on a
+        # regular grid, something scattered on a swath.
+        self.window_basis_ = self.grid_map_.build_window_basis(
+            n_wy, n_wx, w, self.smooth_local, fine
+        )
 
         models = [[None] * n_wx for _ in range(n_wy)]
         for iy in range(n_wy):
@@ -374,29 +359,18 @@ class Sharpener:
                 "predict_local requires window_size > 0 and fitted local models."
             )
         fine = self._as_features(features).sel({self.band_dim: self.band_order_})
-        fine = fine.transpose(self.band_dim, self.y_dim, self.x_dim)
-        if fine.chunks is not None:
-            # A single band chunk keeps every feature together within each block.
-            fine = fine.chunk({self.band_dim: -1})
 
-        models = self.local_models_
-        n_wy = len(models)
-        n_wx = len(models[0])
-        centers_y = self.window_centers_y_
-        centers_x = self.window_centers_x_
-        edges_y = self.window_edges_y_
-        edges_x = self.window_edges_x_
-        smooth = self.smooth_local
+        flat_models = [m for row in self.local_models_ for m in row]
+        basis = self.window_basis_
         y_dim, x_dim, band_dim = self.y_dim, self.x_dim, self.band_dim
 
         def _local_block(block):
             b = block.transpose(band_dim, y_dim, x_dim)
-            yc = np.asarray(b[y_dim].values, dtype=float)
-            xc = np.asarray(b[x_dim].values, dtype=float)
             arr = np.asarray(b.values, dtype=float)  # (n_bands, ny, nx)
             n_bands, nyb, nxb = arr.shape
-            by = window_basis_1d(yc, centers_y, edges_y, smooth)  # (n_wy, nyb)
-            bx = window_basis_1d(xc, centers_x, edges_x, smooth)  # (n_wx, nxb)
+            # (k, ny, nx) window indices and weights; k is 4 for a separable tent,
+            # 3 for barycentric, 1 for hard assignment.
+            widx, wgt = basis.weights(b, y_dim, x_dim)
 
             feat = arr.reshape(n_bands, -1).T  # (npix, n_bands)
             valid = np.all(np.isfinite(feat), axis=1)
@@ -404,38 +378,33 @@ class Sharpener:
             acc = np.zeros((nyb, nxb), dtype=float)
             wsum = np.zeros((nyb, nxb), dtype=float)
             pred_cache = {}
-            for iy in range(n_wy):
-                wy = by[iy]
-                if not wy.any():
-                    continue
-                for ix in range(n_wx):
-                    model = models[iy][ix]
+            for slot in range(widx.shape[0]):
+                idx_2d = widx[slot]
+                w_2d = wgt[slot]
+                # Only windows that actually got a model contribute; the weights of
+                # the rest are left out of wsum, so the blend renormalises over the
+                # models that exist -- as the separable version did.
+                for win in np.unique(idx_2d[(idx_2d >= 0) & (w_2d > 0)]):
+                    model = flat_models[win]
                     if model is None:
                         continue
-                    wx = bx[ix]
-                    if not wx.any():
-                        continue
-                    weight = np.outer(wy, wx)
-                    mask = weight > 0
-                    if not mask.any():
-                        continue
-                    if (iy, ix) not in pred_cache:
+                    mask = (idx_2d == win) & (w_2d > 0)
+                    if win not in pred_cache:
                         pred = np.full(feat.shape[0], np.nan, dtype=float)
                         if valid.any():
                             pred[valid] = model.predict(feat[valid])
-                        pred_cache[(iy, ix)] = pred.reshape(nyb, nxb)
-                    pred2d = pred_cache[(iy, ix)]
+                        pred_cache[win] = pred.reshape(nyb, nxb)
+                    pred2d = pred_cache[win]
                     use = mask & np.isfinite(pred2d)
-                    acc[use] += weight[use] * pred2d[use]
-                    wsum[use] += weight[use]
+                    acc[use] += w_2d[use] * pred2d[use]
+                    wsum[use] += w_2d[use]
 
             out = np.divide(
                 acc, wsum, out=np.full_like(acc, np.nan), where=wsum > 0
             )
-            return xr.DataArray(
-                out, dims=(y_dim, x_dim),
-                coords={y_dim: b[y_dim], x_dim: b[x_dim]},
-            )
+            # Derive the result from the block itself so every coordinate the
+            # template carries (a CF grid-mapping variable, say) comes along.
+            return b.isel({band_dim: 0}, drop=True).astype(float).copy(data=out)
 
         template = fine.isel({band_dim: 0}, drop=True).astype(float)
         local_guess = xr.map_blocks(_local_block, fine, template=template)
@@ -451,14 +420,11 @@ class Sharpener:
         prediction (``NaN``) the global guess is used.
         """
         radiance = self.disaggregating_temperature
+        target = self.grid_map_.prepare_target(target)
 
         def to_coarse(fg):
             r = to_radiance(fg) if radiance else fg
-            c = r.coarsen(
-                {self.y_dim: self.factor_, self.x_dim: self.factor_},
-                boundary=self.boundary,
-            ).mean()
-            return self._match_coarse_coords(c, target)
+            return self.grid_map_.aggregate_mean(r)
 
         obs = to_radiance(target) if radiance else target
         res_local = np.abs(obs - to_coarse(local_fg))
@@ -470,7 +436,7 @@ class Sharpener:
         # Where the local guess is missing, res_local is NaN -> lean fully global.
         ww = ww.where(np.isfinite(ww), 0.0).clip(0.0, 1.0).compute()
 
-        ww_fine = upsample(ww, local_fg, self.x_dim, self.y_dim, method="linear")
+        ww_fine = self.grid_map_.upsample(ww, local_fg, method="linear")
         ww_fine = ww_fine.clip(0.0, 1.0)
         fw_fine = 1.0 - ww_fine
 
@@ -492,28 +458,29 @@ class Sharpener:
         smooths and upsamples the residual, and adds it back to ``first_guess``.
         The corrected result, re-aggregated, reproduces ``target``.
         """
-        if self.factor_ is None:
+        if self.grid_map_ is None:
             raise RuntimeError("residual_correct called before fit.")
+
+        target = self.grid_map_.prepare_target(target)
+        cy, cx = self.grid_map_.coarse_dims
 
         guess = to_radiance(first_guess) if self.disaggregating_temperature else first_guess
         obs = to_radiance(target) if self.disaggregating_temperature else target
 
-        guess_coarse = guess.coarsen(
-            {self.y_dim: self.factor_, self.x_dim: self.factor_},
-            boundary=self.boundary,
-        ).mean()
-        guess_coarse = self._match_coarse_coords(guess_coarse, obs)
+        guess_coarse = self.grid_map_.aggregate_mean(guess)
 
         residual_coarse = (obs - guess_coarse).compute()
         if self.smooth_residual:
             # Gentle correction: smooth then bilinearly upsample (approximate).
-            residual_coarse = binomial_smooth(residual_coarse, self.x_dim, self.y_dim)
+            # A swath is still a 2-D scan array, so a 3x3 binomial in scan-index
+            # space remains a genuine spatial neighbourhood.
+            residual_coarse = binomial_smooth(residual_coarse, cx, cy)
             method = "linear"
         else:
             # Block-constant correction: exactly mass-conserving.
             method = "nearest"
-        residual_fine = upsample(
-            residual_coarse, first_guess, self.x_dim, self.y_dim, method=method
+        residual_fine = self.grid_map_.upsample(
+            residual_coarse, first_guess, method=method
         )
 
         corrected = guess + residual_fine

@@ -24,19 +24,31 @@ dependencies = [
     "scipy",
     "dask",
     "scikit-learn",
+    # Swath support: geolocation transforms and the neighbour search behind
+    # SwathGridMap. Install from conda-forge in a conda environment -- see the
+    # install note in the README.
+    "pyproj",
+    "pyresample",
 ]
 
 [project.optional-dependencies]
-dev = [
+test = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "pytest-xdist>=3.0",
+]
+dev = [
+    "xr_dms[test]",
     "ipython>=8.0",
     "ipykernel>=6.0",
 ]
 
 [tool.pytest.ini_options]
 addopts = "-n auto"
+testpaths = ["tests"]
+# pytest's importlib import mode does not put the test directory on sys.path, so
+# say so explicitly and let the test modules share `scenes.py`.
+pythonpath = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
