@@ -2,7 +2,7 @@
 
 from importlib.metadata import version, PackageNotFoundError
 
-from .sharpener import Sharpener, to_radiance, from_radiance
+from .sharpener import Sharpener, SceneState, to_radiance, from_radiance
 from .gridmap import GridMap, RegularGridMap
 from .geo import SwathGridMap
 from .harmonize import harmonize_features
@@ -19,6 +19,7 @@ except PackageNotFoundError:
 
 __all__ = [
     "Sharpener",
+    "SceneState",
     "GridMap",
     "RegularGridMap",
     "SwathGridMap",

@@ -19,6 +19,10 @@ model can later be applied across neighbouring tiles that blend into each other.
 
 from __future__ import annotations
 
+import copy
+from dataclasses import dataclass, replace
+from typing import Any
+
 import numpy as np
 import xarray as xr
 
@@ -27,10 +31,125 @@ from .aggregation import (
     binomial_smooth,
     homogeneity_cv,
 )
+from .geo import one_block
 from .gridmap import RegularGridMap
 from .regressors import BaseRegressor, SklearnDMSRegressor
 
-__all__ = ["Sharpener", "to_radiance", "from_radiance"]
+__all__ = ["Sharpener", "SceneState", "to_radiance", "from_radiance"]
+
+
+@dataclass
+class SceneState:
+    """Everything scene-global that DMS needs, separated from the fine grid.
+
+    DMS has a natural seam: the regression is fitted on *coarse* statistics and
+    the residual is a *coarse* field, while applying the model and gathering the
+    residual are per-pixel. This holds the coarse half -- a fitted model plus, at
+    most, one coarse-grid array. For a VIIRS granule against Sentinel-2 that is
+    about a megabyte, against a sharpened field of several hundred.
+
+    Keeping it as a value rather than as mutable attributes on the sharpener is
+    what makes deferral possible: a :class:`dask.delayed.Delayed` wrapping one of
+    these can be threaded into the per-chunk graph, and a *computed* one can be
+    cached to disk so a later run's fine half is pure blockwise -- which is the
+    difference between a spatial subset costing one chunk and costing a scene.
+
+    ``global_model=None`` records a scene that could not be fitted (no
+    homogeneous training pixels). Applying such a state yields all-NaN rather
+    than raising, because a lazy graph cannot change its own shape.
+    """
+
+    band_order: list[str]
+    global_model: Any = None
+    cv_threshold: float | None = None
+    n_training_samples: int = 0
+    #: Coarse residual, in whichever space the correction is applied. When set,
+    #: :meth:`Sharpener.apply` needs no scene-global reduction at all.
+    residual_coarse: Any = None
+
+    @property
+    def fitted(self):
+        return self.global_model is not None
+
+
+def _seed_from(*arrays):
+    """A stable 32-bit seed from the training data itself.
+
+    Content-derived rather than fixed, so two different scenes still draw
+    different bootstraps -- it is repeatability that is wanted here, not a
+    single shared seed across a whole time series.
+    """
+    from dask.base import tokenize
+
+    return int(tokenize(*arrays)[:8], 16)
+
+
+def _is_delayed(obj):
+    """True for a ``dask.delayed.Delayed``, without importing dask eagerly."""
+    return type(obj).__module__.startswith("dask.") and hasattr(obj, "dask")
+
+
+def _boxed(state):
+    """A :class:`SceneState` as a 0-d argument ``apply_ufunc`` can broadcast.
+
+    A ``Delayed`` state has to reach the per-chunk function as a dask *dependency*
+    rather than as a captured constant, or computing any block would drag the fit
+    out of the graph. Wrapping it in a 0-d object array is the standard way to say
+    that: ``dask="parallelized"`` broadcasts it against every block.
+
+    Note that this makes the fit a shared *dependency*, not a single *execution*.
+    The residual correction consumes the first guess on two branches, and dask
+    will evaluate the fit on each -- which is why :meth:`BaseRegressor.seeded`
+    exists.
+    """
+    if not _is_delayed(state):
+        return xr.DataArray(np.array(state, dtype=object))
+
+    import dask.array as dsa
+
+    return xr.DataArray(dsa.from_delayed(state, shape=(), dtype=object))
+
+
+def _unbox(state):
+    """Recover the :class:`SceneState` inside a 0-d object array."""
+    return state.item() if hasattr(state, "item") else state
+
+
+def _band_order_of(state, fine, band_dim):
+    """The training band order, from the state if it is known, else from ``fine``.
+
+    A ``Delayed`` state cannot answer at graph-build time, and the band selection
+    has to happen there -- so fall back to the features' own order, which is how
+    :meth:`Sharpener.fit_delayed` derived it in the first place. The two are
+    cross-checked inside :func:`_predict_block`, where the state is concrete.
+    """
+    if not _is_delayed(state) and state.band_order is not None:
+        return list(state.band_order)
+    return [str(b) for b in fine[band_dim].values]
+
+
+def _predict_block(arr, state, band_order):
+    """Apply the fitted regressor to one block of fine features.
+
+    ``arr`` has band as the last axis: ``(..., n_bands)``. An unfitted state
+    yields all-NaN -- the lazy counterpart of :meth:`Sharpener.fit` raising.
+    """
+    state = _unbox(state)
+    spatial = arr.shape[:-1]
+    if not state.fitted:
+        return np.full(spatial, np.nan, dtype=float)
+    if list(state.band_order) != list(band_order):
+        raise ValueError(
+            f"Features are ordered {list(band_order)} but the model was trained "
+            f"on {list(state.band_order)}."
+        )
+    n_bands = arr.shape[-1]
+    flat = arr.reshape(-1, n_bands)
+    out = np.full(flat.shape[0], np.nan, dtype=float)
+    valid = np.all(np.isfinite(flat), axis=1)
+    if valid.any():
+        out[valid] = state.global_model.predict(flat[valid])
+    return out.reshape(spatial)
 
 
 def to_radiance(temperature):
@@ -210,6 +329,93 @@ class Sharpener:
         model.fit(X[homogeneous], y[homogeneous], sample_weight=weights)
         return model, float(threshold), int(homogeneous.sum())
 
+    def _setup_grid_map(self, fine, target):
+        """Resolve and record the grid map (and its coarsening factor, if any)."""
+        self.grid_map_ = self.grid_map if self.grid_map is not None else (
+            RegularGridMap.from_grids(
+                fine, target, self.x_dim, self.y_dim, self.boundary
+            )
+        )
+        self.factor_ = getattr(self.grid_map_, "factor", None)
+        return self.grid_map_
+
+    def _training_arrays(self, fine, target):
+        """The three coarse training fields, oriented but *not* materialised.
+
+        ``(mean, y, cv)`` as ``(ny, nx, n_bands)``, ``(ny, nx)``, ``(ny, nx)``.
+        Whether these are numpy- or dask-backed is decided by the grid map: an
+        eagerly built one aggregates eagerly, a lazily built one leaves the whole
+        reduction in the graph. Splitting this out is what lets :meth:`fit` and
+        :meth:`fit_delayed` share one definition of "the training data".
+        """
+        cy, cx = self.grid_map_.coarse_dims
+        mean, std = self.grid_map_.aggregate(fine, self.band_dim)
+        cv = homogeneity_cv(mean, std, self.band_dim)
+        return (
+            mean.transpose(cy, cx, self.band_dim),
+            target.transpose(cy, cx),
+            cv.transpose(cy, cx),
+        )
+
+    def fit_delayed(self, features, target):
+        """:meth:`fit` deferred: a ``Delayed`` :class:`SceneState`, nothing computed.
+
+        The counterpart to :meth:`fit` for building a graph over many scenes at
+        once. Nothing here reads a pixel -- the aggregation, the homogeneity
+        screen and the regression all land in the graph -- so assembling a whole
+        time series costs metadata only, and computing one scene computes only
+        that scene.
+
+        Where :meth:`fit` raises on a scene with no homogeneous training pixels,
+        this returns a state with ``global_model=None``: by the time the
+        condition is known the graph's shape is already fixed, so the failure has
+        to be a value (an all-NaN slab from :meth:`apply`) rather than an
+        exception. Check :attr:`SceneState.fitted` on the computed result.
+
+        Requires ``window_size == 0``; moving-window models need the projected
+        swath centres, which a lazily built grid map does not materialise.
+        """
+        import dask
+
+        if self.window_size > 0:
+            raise NotImplementedError(
+                "fit_delayed does not support moving-window models "
+                "(window_size > 0); use fit()."
+            )
+
+        fine = self._as_features(features)
+        band_order = [str(b) for b in fine[self.band_dim].values]
+        self._setup_grid_map(fine, target)
+        target = self.grid_map_.prepare_target(target)
+
+        mean, y, cv = self._training_arrays(fine, target)
+        full = (slice(None), slice(None))
+
+        def _fit(mean_arr, y_arr, cv_arr):
+            mean_arr = np.asarray(mean_arr)
+            y_arr = np.asarray(y_arr)
+            cv_arr = np.asarray(cv_arr)
+            # Dask may evaluate this task more than once (the first guess feeds
+            # both the residual aggregation and the final sum), so it has to be a
+            # pure function of the training data or the two evaluations disagree
+            # and the residual correction stops conserving mass. See
+            # BaseRegressor.seeded.
+            pure = copy.copy(self)
+            pure.regressor = self.regressor.seeded(
+                _seed_from(mean_arr, y_arr, cv_arr)
+            )
+            result = pure._fit_region(
+                mean_arr, y_arr, cv_arr, *full, local=False, min_samples=1,
+            )
+            if result is None:
+                return SceneState(band_order=band_order)
+            model, threshold, n = result
+            return SceneState(band_order, model, threshold, n)
+
+        return dask.delayed(_fit, pure=True)(
+            one_block(mean.data), one_block(y.data), one_block(cv.data),
+        )
+
     def fit(self, features, target):
         """Train the regressor on homogeneous coarse pixels (steps 1-3).
 
@@ -230,24 +436,16 @@ class Sharpener:
         """
         fine = self._as_features(features)
         self.band_order_ = [str(b) for b in fine[self.band_dim].values]
-
-        self.grid_map_ = self.grid_map if self.grid_map is not None else (
-            RegularGridMap.from_grids(
-                fine, target, self.x_dim, self.y_dim, self.boundary
-            )
-        )
-        self.factor_ = getattr(self.grid_map_, "factor", None)
-        cy, cx = self.grid_map_.coarse_dims
+        self._setup_grid_map(fine, target)
         target = self.grid_map_.prepare_target(target)
 
-        mean, std = self.grid_map_.aggregate(fine, self.band_dim)
-        cv = homogeneity_cv(mean, std, self.band_dim)
+        mean, y, cv = self._training_arrays(fine, target)
 
         # Bring the (small) coarse training arrays into memory.
         # mean_arr: (ny, nx, n_bands) with band as the last axis.
-        mean_arr = mean.transpose(cy, cx, self.band_dim).values
-        y_arr = np.asarray(target.transpose(cy, cx).values)
-        cv_arr = np.asarray(cv.transpose(cy, cx).values)
+        mean_arr = np.asarray(mean.values)
+        y_arr = np.asarray(y.values)
+        cv_arr = np.asarray(cv.values)
         full = (slice(None), slice(None))
 
         # -- global model (whole scene) --
@@ -295,36 +493,42 @@ class Sharpener:
         self.local_models_ = models
 
     # -- STEP 4: apply to fine features -> first guess -----------------------
-    def predict(self, features):
+    def _resolve_state(self, state):
+        """``state`` as given, or the one :meth:`fit` left on ``self``."""
+        if state is not None:
+            return state
+        if not self.fitted_:
+            raise RuntimeError("Sharpener.predict called before fit.")
+        return SceneState(
+            band_order=self.band_order_,
+            global_model=self.global_model_,
+            cv_threshold=getattr(self, "cv_threshold_", None),
+            n_training_samples=getattr(self, "n_training_samples_", 0),
+        )
+
+    def predict(self, features, state=None):
         """Apply the fitted regressor to the fine features (step 4).
 
         Returns a lazy fine-resolution first guess. If ``features`` is
         dask-backed the result stays dask-backed (the regressor is applied per
         chunk via :func:`xarray.apply_ufunc`).
+
+        ``state`` accepts a :class:`SceneState` -- or a ``Delayed`` one from
+        :meth:`fit_delayed` -- instead of the model left on ``self`` by
+        :meth:`fit`, which is what lets many scenes share one sharpener.
         """
-        if not self.fitted_:
-            raise RuntimeError("Sharpener.predict called before fit.")
+        state = self._resolve_state(state)
         fine = self._as_features(features)
+        band_order = _band_order_of(state, fine, self.band_dim)
         # Reorder bands to the training order so feature columns line up.
-        fine = fine.sel({self.band_dim: self.band_order_})
-
-        regressor = self.global_model_
-
-        def _predict_block(arr):
-            # arr has band as the last axis: (..., n_bands).
-            spatial = arr.shape[:-1]
-            n_bands = arr.shape[-1]
-            flat = arr.reshape(-1, n_bands)
-            out = np.full(flat.shape[0], np.nan, dtype=float)
-            valid = np.all(np.isfinite(flat), axis=1)
-            if valid.any():
-                out[valid] = regressor.predict(flat[valid])
-            return out.reshape(spatial)
+        fine = fine.sel({self.band_dim: band_order})
 
         first_guess = xr.apply_ufunc(
             _predict_block,
             fine,
-            input_core_dims=[[self.band_dim]],
+            _boxed(state),
+            kwargs={"band_order": band_order},
+            input_core_dims=[[self.band_dim], []],
             output_core_dims=[[]],
             dask="parallelized",
             output_dtypes=[float],
@@ -450,13 +654,18 @@ class Sharpener:
         return blended.rename("first_guess")
 
     # -- STEP 5: residual correction -----------------------------------------
-    def residual_correct(self, first_guess, target):
+    def residual_correct(self, first_guess, target, residual_coarse=None):
         """Make the fine first guess consistent with the coarse observation.
 
         Aggregates ``first_guess`` back to the coarse grid, differences against
         ``target`` (in radiance space when ``disaggregating_temperature``),
         smooths and upsamples the residual, and adds it back to ``first_guess``.
         The corrected result, re-aggregated, reproduces ``target``.
+
+        Pass ``residual_coarse`` to skip the aggregation entirely -- the residual
+        is the only scene-global reduction left in the fine half, so supplying a
+        precomputed one (see :attr:`SceneState.residual_coarse`) is what makes a
+        spatial subset cost a chunk instead of a whole scene.
         """
         if self.grid_map_ is None:
             raise RuntimeError("residual_correct called before fit.")
@@ -465,11 +674,16 @@ class Sharpener:
         cy, cx = self.grid_map_.coarse_dims
 
         guess = to_radiance(first_guess) if self.disaggregating_temperature else first_guess
-        obs = to_radiance(target) if self.disaggregating_temperature else target
 
-        guess_coarse = self.grid_map_.aggregate_mean(guess)
-
-        residual_coarse = (obs - guess_coarse).compute()
+        if residual_coarse is None:
+            obs = to_radiance(target) if self.disaggregating_temperature else target
+            guess_coarse = self.grid_map_.aggregate_mean(guess)
+            residual_coarse = obs - guess_coarse
+            # An eagerly built grid map has already read the fine grid to get
+            # here, so materialising costs nothing and keeps the graph small. A
+            # lazy one must stay in the graph -- that is the whole point.
+            if not self.grid_map_.lazy:
+                residual_coarse = residual_coarse.compute()
         if self.smooth_residual:
             # Gentle correction: smooth then bilinearly upsample (approximate).
             # A swath is still a 2-D scan array, so a 3x3 binomial in scan-index
@@ -502,12 +716,69 @@ class Sharpener:
             return self._blend_local_global(local_fg, global_fg, target)
         return global_fg
 
-    def sharpen(self, features, target):
+    def apply(self, state, features, target):
+        """Steps 4-5 against a given :class:`SceneState`: the fine half of DMS.
+
+        The counterpart to :meth:`fit_delayed`. ``state`` may be a concrete
+        :class:`SceneState` or a ``Delayed`` one; either way nothing is computed
+        here.
+
+        How well a subset of the result culls depends on what ``state`` carries:
+
+        * with ``state.residual_coarse`` set, this is pure blockwise -- predict,
+          gather, add -- so ``result.isel(y=..., x=...)`` costs only the chunks
+          asked for;
+        * without it, the residual is derived in-graph, which is a scene-global
+          reduction over the first guess, so any output chunk pulls the whole
+          scene through :meth:`predict`. That is DMS, not the plumbing: a global
+          regression needs global statistics.
+
+        Use :meth:`scene_state` to build the first kind.
+        """
+        if self.grid_map_ is None:
+            self._setup_grid_map(self._as_features(features), target)
+        guess = self.predict(features, state=state)
+        residual = None if _is_delayed(state) else state.residual_coarse
+        return self.residual_correct(guess, target, residual_coarse=residual)
+
+    def scene_state(self, features, target):
+        """A ``Delayed`` :class:`SceneState` carrying the coarse residual too.
+
+        :meth:`fit_delayed` plus the residual, so the whole scene-global half of
+        DMS is one deferred value. Computing and caching these turns :meth:`apply`
+        into a pure blockwise graph -- which is the only way a spatial subset of
+        the sharpened field costs less than a full scene.
+        """
+        import dask
+
+        state = self.fit_delayed(features, target)
+        guess = self.predict(features, state=state)
+
+        prepared = self.grid_map_.prepare_target(target)
+        guess_r = to_radiance(guess) if self.disaggregating_temperature else guess
+        obs = to_radiance(prepared) if self.disaggregating_temperature else prepared
+        residual = obs - self.grid_map_.aggregate_mean(guess_r)
+
+        @dask.delayed(pure=True)
+        def _attach(st, resid):
+            return replace(st, residual_coarse=resid)
+
+        return _attach(state, residual)
+
+    def sharpen(self, features, target, lazy=False):
         """Fit, predict and residual-correct in one call (steps 1-5).
 
         With ``window_size > 0`` the local and global first guesses are blended
         (Gao 2012 section 2.3) before the residual correction. Returns the lazy
         sharpened fine-resolution :class:`xarray.DataArray`.
+
+        ``lazy=True`` defers the training as well, via :meth:`fit_delayed` and
+        :meth:`apply`, so the call touches no pixel at all and a scene that
+        cannot be fitted comes back all-NaN instead of raising. It needs
+        ``window_size == 0``, and leaves ``self`` unfitted -- the model lives in
+        the returned graph, not on the sharpener.
         """
+        if lazy:
+            return self.apply(self.fit_delayed(features, target), features, target)
         self.fit(features, target)
         return self.residual_correct(self.first_guess(features, target), target)

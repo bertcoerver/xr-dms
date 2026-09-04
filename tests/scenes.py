@@ -165,6 +165,36 @@ def make_multires_scene(fine_shape=(120, 120), res=10.0, ratios=(1, 2, 6),
     return bands, target_da, truth_da, factor
 
 
+def make_swath_lonlat(features, fine_shape=(300, 300), res=20.0, swath_res=375.0):
+    """The curvilinear geolocation :func:`make_swath_scene` builds its map from.
+
+    Skewed across-track, curved along-track, and rotated relative to the UTM
+    axes -- nothing a rectilinear shortcut can exploit. Separate from
+    :func:`make_swath_scene` because the lazy path is built from the raw lon/lat
+    rather than from the map that came out of them.
+    """
+    from pyproj import CRS, Transformer
+
+    H, W = fine_shape
+    crs = CRS.from_user_input(UTM_CRS)
+    to_ll = Transformer.from_crs(crs, CRS.from_epsg(4326), always_xy=True)
+    lon_c, lat_c = to_ll.transform(
+        np.asarray(features["x"].values).mean(),
+        np.asarray(features["y"].values).mean(),
+    )
+    ny = int(H * res / swath_res) + 4
+    nx = int(W * res / swath_res) + 4
+    jj, ii = np.mgrid[0:ny, 0:nx].astype(float)
+    deg = swath_res / 111320.0
+    lon = (lon_c + (ii - nx / 2) * deg / np.cos(np.deg2rad(lat_c))
+           + 0.15 * (jj - ny / 2) * deg)
+    lat = lat_c - (jj - ny / 2) * deg + 0.10 * np.sin(ii / 5.0) * deg
+    return (
+        xr.DataArray(lon, dims=("y", "x"), name="longitude"),
+        xr.DataArray(lat, dims=("y", "x"), name="latitude"),
+    )
+
+
 def make_swath_scene(fine_shape=(300, 300), res=20.0, swath_res=375.0, seed=0):
     """A projected fine grid plus a genuinely curvilinear swath over it.
 
@@ -208,22 +238,7 @@ def make_swath_scene(fine_shape=(300, 300), res=20.0, swath_res=375.0, seed=0):
     )
     truth_da = xr.DataArray(truth, dims=("y", "x"), coords=coords, name="truth")
 
-    # A curvilinear swath: skewed across-track, curved along-track, and rotated
-    # relative to the UTM axes -- nothing a rectilinear shortcut can exploit.
-    to_ll = Transformer.from_crs(crs, CRS.from_epsg(4326), always_xy=True)
-    lon_c, lat_c = to_ll.transform(fine_x.mean(), fine_y.mean())
-    span_y = H * res / swath_res
-    span_x = W * res / swath_res
-    ny = int(span_y) + 4
-    nx = int(span_x) + 4
-    jj, ii = np.mgrid[0:ny, 0:nx].astype(float)
-    deg = swath_res / 111320.0
-    lon = (lon_c + (ii - nx / 2) * deg / np.cos(np.deg2rad(lat_c))
-           + 0.15 * (jj - ny / 2) * deg)
-    lat = lat_c - (jj - ny / 2) * deg + 0.10 * np.sin(ii / 5.0) * deg
-    lon_da = xr.DataArray(lon, dims=("y", "x"), name="longitude")
-    lat_da = xr.DataArray(lat, dims=("y", "x"), name="latitude")
-
+    lon_da, lat_da = make_swath_lonlat(features, fine_shape, res, swath_res)
     grid_map = SwathGridMap.from_lonlat(lon_da, lat_da, fine=features)
 
     # The coarse sensor sees the mean over its footprint, in radiance space.

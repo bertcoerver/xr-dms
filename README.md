@@ -8,7 +8,9 @@ applying it to the fine features, and residual-correcting so the result stays
 consistent with the coarse observation (mass conservation).
 
 Everything is dask-friendly: pass chunked `DataArray`s and the pipeline stays
-lazy end to end.
+lazy end to end. By default the *training* half still runs eagerly when you call
+`sharpen` — see [Deferring the fit](#deferring-the-fit) to keep that in the graph
+too, which is what lets you build a whole time series before computing anything.
 
 ## Installation
 
@@ -98,6 +100,56 @@ sharpened field through the same map reproduces the raw observations to ~1e-14.
 
 Set `disaggregating_temperature=True` only when the target really is in Kelvin;
 a target already in radiance averages linearly and needs no `T**4`.
+
+### Deferring the fit
+
+`sharpen` trains eagerly: it aggregates the fine features, fits the regression and
+differences the residual before it hands back a graph. That is a full pass over
+the fine grid per scene, which is fine for one scene and painful for fifty —
+you wait for all of them before you can subset any of them.
+
+`lazy=True` puts the training in the graph as well, so nothing is read until you
+ask:
+
+```python
+grid_map = SwathGridMap.from_lonlat(lon, lat, fine=optical, lazy=True)
+sharpened = Sharpener(grid_map=grid_map).sharpen(optical, thermal, lazy=True)
+```
+
+Build one of those per overpass, `xr.concat` them on a time axis, and
+`cube.isel(time=3).compute()` sharpens exactly one scene — the rest of the graph
+is culled. Two things change on this path:
+
+- **A scene that cannot be fitted returns NaN instead of raising.** A lazy graph's
+  shape is fixed before any pixel is read, so "no homogeneous training pixels"
+  cannot be an exception any more. It becomes `SceneState.fitted == False` and an
+  all-NaN slab.
+- **`window_size > 0` and `upsample(method="linear")` are unavailable**, because a
+  lazily built `SwathGridMap` never materialises the projected swath centres they
+  need.
+
+Spatial subsetting still costs a whole scene, because the regression and the
+residual are scene-global reductions. To make it cost a chunk, cache the coarse
+half once:
+
+```python
+state = Sharpener(grid_map=grid_map).scene_state(optical, thermal).compute()
+sharpened = Sharpener(grid_map=grid_map).apply(state, optical, thermal)
+sharpened.isel(y=slice(0, 512), x=slice(0, 512)).compute()   # reads one tile
+```
+
+A `SceneState` is a fitted model plus one coarse-grid residual — about a megabyte
+for a VIIRS granule against Sentinel-2 — and pickles, so a season's worth of them
+is a small file rather than a re-run. With one in hand `apply` is pure blockwise:
+predict, gather, add.
+
+> **Regressors must be pure on the lazy path.** Dask offers no guarantee that a
+> task runs once, and the residual correction consumes the first guess twice — so
+> a regressor drawing on the global RNG would fit two *different* models in one
+> graph and silently stop conserving mass. `BaseRegressor.seeded` is the hook that
+> prevents this; `SklearnDMSRegressor` implements it by pinning the bagging seed
+> from the training data (an explicit `bagging_opt["random_state"]` always wins).
+> A custom stochastic backend must override it.
 
 ### Features at mixed resolutions
 

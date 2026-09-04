@@ -113,6 +113,10 @@ class GridMap(ABC):
     #: ``(ny, nx)`` shape of the coarse grid.
     coarse_shape: tuple
 
+    #: True when the map's own geometry is still in the dask graph, so callers
+    #: know not to force it (see :meth:`SwathGridMap.from_lonlat`'s ``lazy``).
+    lazy = False
+
     @abstractmethod
     def prepare_target(self, target):
         """Validate the coarse observation and put it in the coarse namespace."""

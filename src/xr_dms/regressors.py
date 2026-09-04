@@ -64,6 +64,23 @@ class BaseRegressor(ABC):
         """
         return copy.deepcopy(self)
 
+    def seeded(self, seed: int) -> "BaseRegressor":
+        """Return a copy whose fit is reproducible under ``seed``.
+
+        Deferred fitting (:meth:`~xr_dms.sharpener.Sharpener.fit_delayed`) puts
+        the training step inside a dask graph, and dask offers no guarantee that
+        a task runs only once -- an expression can be evaluated again on another
+        branch. A backend drawing from the global RNG would then produce two
+        *different* models in one graph, and the residual correction, which
+        differences an observation against a prediction, would be correcting the
+        wrong model: mass conservation quietly breaks.
+
+        So a deferred fit demands a pure function of its inputs. The default
+        returns ``self`` unchanged, which is correct for any backend that is
+        already deterministic; a stochastic one must override this.
+        """
+        return self
+
 
 class DecisionTreeRegressorWithLinearLeafRegression(tree.DecisionTreeRegressor):
     """Regression tree whose leaves predict via a local Ridge regression.
@@ -194,6 +211,24 @@ class SklearnDMSRegressor(BaseRegressor):
             regressor_opt=self.regressor_opt,
             bagging_opt=self.bagging_opt,
         )
+
+    def seeded(self, seed: int) -> "SklearnDMSRegressor":
+        """Pin the bootstrap RNG so a deferred fit is a pure function.
+
+        :class:`~sklearn.ensemble.BaggingRegressor` draws its bootstrap samples
+        from numpy's global RNG unless told otherwise, which makes two fits of
+        identical data differ by a couple of Kelvin here. See
+        :meth:`BaseRegressor.seeded` for why a dask graph cannot tolerate that.
+
+        An explicit ``random_state`` in ``bagging_opt`` always wins -- if the
+        caller has pinned the seed they have already made the fit pure, and
+        silently overriding their choice would be the greater surprise.
+        """
+        if "random_state" in self.bagging_opt:
+            return self
+        clone = self.clone(local=self.local)
+        clone.bagging_opt = {**self.bagging_opt, "random_state": int(seed)}
+        return clone
 
     def fit(self, X, y, sample_weight=None):
         X = np.asarray(X, dtype=float)
