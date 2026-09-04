@@ -5,6 +5,7 @@ from importlib.metadata import version, PackageNotFoundError
 from .sharpener import Sharpener, to_radiance, from_radiance
 from .gridmap import GridMap, RegularGridMap
 from .geo import SwathGridMap
+from .harmonize import harmonize_features
 from .regressors import (
     BaseRegressor,
     DecisionTreeRegressorWithLinearLeafRegression,
@@ -24,6 +25,7 @@ __all__ = [
     "BaseRegressor",
     "DecisionTreeRegressorWithLinearLeafRegression",
     "SklearnDMSRegressor",
+    "harmonize_features",
     "to_radiance",
     "from_radiance",
     "__version__",

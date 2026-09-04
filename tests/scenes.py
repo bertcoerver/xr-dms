@@ -105,6 +105,66 @@ def make_varying_scene(fine_shape=(160, 160), factor=8, seed=0):
 UTM_CRS = "EPSG:32636"  # Nile delta, the region the real VIIRS/S2 pairing covers
 
 
+def make_multires_scene(fine_shape=(120, 120), res=10.0, ratios=(1, 2, 6),
+                        factor=12, seed=0):
+    """Feature bands at several resolutions over one footprint -- the S2 case.
+
+    Every band is derived by block-averaging the same 10 m field, so the coarser
+    bands nest *exactly* inside the finest one the way Sentinel-2's 10/20/60 m
+    grids nest inside each other. That is what lets a test assert the harmoniser's
+    exactness guarantee against a ground truth rather than against a tolerance:
+    aggregating the harmonised band must reproduce aggregating the native one.
+
+    ``ratios`` are multiples of ``res`` -- ``(1, 2, 6)`` gives 10 m, 20 m and 60 m.
+    ``factor`` is the coarsening from the finest grid to the target, so it must be
+    a multiple of every ratio for the coarse pixels to tile all three grids.
+
+    Returns ``(bands, target_da, truth_da, factor)`` where ``bands`` maps
+    ``"b10"``/``"b20"``/``"b60"`` to DataArrays on their own grids.
+    """
+    rng = np.random.default_rng(seed)
+    H, W = fine_shape
+    x0, y0 = 300000.0, 3220000.0  # upper-left corner, UTM metres
+    fine_x = x0 + (np.arange(W) + 0.5) * res
+    fine_y = y0 - (np.arange(H) + 0.5) * res  # descending: north-up
+
+    yy, xx = np.mgrid[0:H, 0:W] / max(H, W)
+    ndvi = np.clip(0.5 + 0.4 * np.sin(6 * xx) * np.cos(5 * yy)
+                   + 0.1 * rng.standard_normal((H, W)), 0, 1)
+    albedo = np.clip(0.3 - 0.2 * ndvi + 0.1 * np.cos(10 * xx + 3 * yy)
+                     + 0.03 * rng.standard_normal((H, W)), 0.05, 0.6)
+    builtup = (np.sin(3 * xx) > 0.4).astype(float) + 0.03 * rng.standard_normal((H, W))
+    truth = (305.0 - 18.0 * ndvi + 12.0 * albedo + 8.0 * builtup
+             + 10.0 * np.sin(8.0 * ndvi) + 0.2 * rng.standard_normal((H, W)))
+
+    from pyproj import CRS
+
+    spatial_ref = xr.DataArray(0, attrs={"crs_wkt": CRS.from_user_input(UTM_CRS).to_wkt()})
+    coords = {"y": fine_y, "x": fine_x, "spatial_ref": spatial_ref}
+    source = {"ndvi": ndvi, "albedo": albedo, "builtup": builtup}
+
+    bands = {}
+    for ratio, (name, values) in zip(ratios, source.items()):
+        da = xr.DataArray(values, dims=("y", "x"), coords=coords, name=name)
+        if ratio > 1:
+            da = da.coarsen(y=ratio, x=ratio, boundary="exact").mean()
+        bands[f"b{int(res * ratio)}"] = da.rename(f"b{int(res * ratio)}")
+
+    lowres = _block_mean(truth ** 4, factor) ** 0.25
+    h, w = lowres.shape
+    target_da = xr.DataArray(
+        lowres, dims=("y", "x"),
+        coords={"y": fine_y.reshape(h, factor).mean(axis=1),
+                "x": fine_x.reshape(w, factor).mean(axis=1)},
+        name="target",
+    )
+    truth_da = xr.DataArray(
+        truth, dims=("y", "x"),
+        coords={"y": fine_y, "x": fine_x}, name="truth",
+    )
+    return bands, target_da, truth_da, factor
+
+
 def make_swath_scene(fine_shape=(300, 300), res=20.0, swath_res=375.0, seed=0):
     """A projected fine grid plus a genuinely curvilinear swath over it.
 

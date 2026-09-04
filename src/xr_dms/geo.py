@@ -27,6 +27,8 @@ from __future__ import annotations
 import numpy as np
 import xarray as xr
 
+from ._grids import axis_step as _axis_step
+from ._grids import crs_of, locate as _locate
 from .aggregation import EPS
 from .gridmap import GridMap, WindowBasis
 
@@ -40,44 +42,15 @@ COARSE_X = "_dms_cx"
 
 
 # -- fine grid description ---------------------------------------------------
+#: A swath always needs a CRS on the fine side -- there is nothing to project the
+#: geolocation into without one -- so the shared reader is pinned to required.
 def _crs_from(obj):
-    """Find a CRS on an xarray object, without requiring rioxarray.
-
-    Looks for the CF grid-mapping variable that rioxarray writes (``spatial_ref``
-    or ``crs``) and reads the WKT off its attributes.
-    """
-    from pyproj import CRS
-
-    for name in ("spatial_ref", "crs"):
-        if name in getattr(obj, "coords", {}) or name in getattr(obj, "variables", {}):
-            var = obj[name]
-            for key in ("crs_wkt", "spatial_ref"):
-                wkt = var.attrs.get(key)
-                if wkt:
-                    return CRS.from_user_input(wkt)
-            if var.attrs:
-                try:
-                    return CRS.from_cf(var.attrs)
-                except Exception:  # noqa: BLE001 - fall through to the error below
-                    pass
-    raise ValueError(
-        "Could not determine the CRS of the fine grid. Pass crs=... explicitly, "
-        "or attach a CF grid-mapping variable (rioxarray's .rio.write_crs())."
-    )
+    """Find a CRS on an xarray object, or raise. See :func:`xr_dms._grids.crs_of`."""
+    return crs_of(obj, required=True)
 
 
-def _axis_step(values, name):
-    """Uniform step of a 1-D coordinate, or raise."""
-    if values.size < 2:
-        raise ValueError(f"Fine coordinate {name!r} needs at least 2 points.")
-    steps = np.diff(values)
-    step = steps[0]
-    if not np.allclose(steps, step, rtol=1e-6, atol=abs(step) * 1e-6):
-        raise ValueError(
-            f"Fine coordinate {name!r} is not evenly spaced; SwathGridMap needs a "
-            "regular projected grid on the fine side."
-        )
-    return float(step)
+#: What a non-uniform fine coordinate breaks, in SwathGridMap's terms.
+_SWATH_CONTEXT = "a regular projected grid on the fine side"
 
 
 def _area_from_fine(fine, x_dim, y_dim, crs):
@@ -91,8 +64,8 @@ def _area_from_fine(fine, x_dim, y_dim, crs):
 
     xs = np.asarray(fine[x_dim].values, dtype=float)
     ys = np.asarray(fine[y_dim].values, dtype=float)
-    dx = _axis_step(xs, x_dim)
-    dy = _axis_step(ys, y_dim)
+    dx = _axis_step(xs, x_dim, _SWATH_CONTEXT)
+    dy = _axis_step(ys, y_dim, _SWATH_CONTEXT)
 
     # Pixel-edge extent from centre coordinates.
     x_lo, x_hi = xs.min() - abs(dx) / 2, xs.max() + abs(dx) / 2
@@ -104,25 +77,6 @@ def _area_from_fine(fine, x_dim, y_dim, crs):
     )
     # pyresample row 0 is the northernmost; flip if the data is stored the other way.
     return area, dy > 0, dx < 0
-
-
-def _locate(global_coord, block_coord):
-    """Integer positions of ``block_coord`` within ``global_coord``.
-
-    Lets a per-block computation recover its offset into the global grid from its
-    coordinates alone, which is what keeps the window basis chunk-invariant.
-    """
-    ascending = global_coord.size < 2 or global_coord[-1] >= global_coord[0]
-    ref = global_coord if ascending else global_coord[::-1]
-    pos = np.searchsorted(ref, block_coord)
-    pos = np.clip(pos, 0, ref.size - 1)
-    # searchsorted lands left of an exact hit only under floating-point noise;
-    # pick whichever neighbour is actually closest.
-    left = np.clip(pos - 1, 0, ref.size - 1)
-    pick = np.where(
-        np.abs(ref[left] - block_coord) <= np.abs(ref[pos] - block_coord), left, pos
-    )
-    return pick if ascending else global_coord.size - 1 - pick
 
 
 # -- labelled reductions -----------------------------------------------------

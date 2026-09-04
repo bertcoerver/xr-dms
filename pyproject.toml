@@ -32,6 +32,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Only harmonize_features' fallback path needs this, and only for bands whose
+# grids do not nest. Nested grids (Sentinel-2's 10/20/60 m) resample by pure
+# index arithmetic and pull in nothing extra.
+reproject = [
+    "xr_utils",
+]
 test = [
     "pytest>=7.0",
     "pytest-cov>=4.0",

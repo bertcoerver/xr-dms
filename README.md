@@ -99,6 +99,47 @@ sharpened field through the same map reproduces the raw observations to ~1e-14.
 Set `disaggregating_temperature=True` only when the target really is in Kelvin;
 a target already in radiance averages linearly and needs no `T**4`.
 
+### Features at mixed resolutions
+
+`Sharpener` needs every feature on one grid. Sentinel-2 does not oblige — its
+bands are 10 m, 20 m and 60 m — so put them on one grid first:
+
+```python
+from xr_dms import harmonize_features
+
+features = harmonize_features({
+    "blue": b02_10m, "green": b03_10m, "red": b04_10m, "nir": b08_10m,
+    "swir": b11_20m, "water_vapour": b09_60m,
+})                                   # -> one Dataset on the 10 m grid
+sharpened = Sharpener(grid_map=grid_map).sharpen(features, thermal)
+```
+
+Upsampling is nearest by default, and that is not a shortcut: replicating a value
+`k` times leaves both the block mean and the block std bit-for-bit unchanged, and
+mean and std are the only things aggregation produces. So **aggregating a
+harmonised band is exactly equal to aggregating it on its own native grid** — the
+sharpener's training samples are identical either way. That is why there is no
+multi-resolution grid map: it would buy memory, not accuracy. (The guarantee is
+specific to nearest. `upsample="linear"` smooths, which moves the block std and
+with it the homogeneity score that picks training pixels.)
+
+Two things to weigh before adding a coarse band:
+
+- **One NaN voids the pixel.** `predict` keeps a pixel only where every feature is
+  finite, so one cloudy 60 m pixel voids the whole 6×6 block of 10 m output under
+  it. The output's valid fraction is therefore capped by the *coarsest* band's —
+  and a 60 m cloud mask is blunter than a 10 m one, flagging whole 60 m pixels
+  where a finer mask would have kept most of the area.
+- **`grid="coarsest"` is cheaper but blunter.** Block-averaging the finer bands
+  down preserves the coarse mean exactly and shrinks the within-pixel std — the
+  quantity training-sample selection reads.
+
+Bands on grids that do not nest (a different CRS, a non-integer ratio, misaligned
+pixel edges) fall back to a warp via [`xr_utils`](../xr-utils) and warn, since the
+exactness guarantee no longer holds. Note that `lazy_dino` refuses a
+mixed-resolution request at load time — its variables must share a grid — so load
+one group per resolution and combine them here.
+
 See [`examples/sharpen_xarray.py`](examples/sharpen_xarray.py) for a complete,
 runnable end-to-end example on the bundled sample scene,
 [`examples/sharpen_swath.py`](examples/sharpen_swath.py) for the VIIRS-onto-Sentinel-2
