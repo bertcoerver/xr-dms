@@ -265,8 +265,16 @@ class Sharpener:
         self.window_basis_ = None
 
     # -- input normalisation -------------------------------------------------
-    def _as_features(self, features):
-        """Normalise features to a ``(band, y, x)`` DataArray."""
+    def _as_features(self, features, extra_dims=()):
+        """Normalise features to a ``(band, y, x)`` DataArray.
+
+        ``extra_dims`` names dimensions to tolerate and leave in front of the
+        band/y/x ones -- :func:`xr_dms.cube.sharpen_cube` passes the time axis,
+        because it sharpens a whole series in one graph. Everything else in this
+        class is per-scene and leaves it empty, so an accidental time dimension
+        is still caught where it would otherwise become a confusing shape error
+        deep in the regressor.
+        """
         if isinstance(features, xr.Dataset):
             da = features.to_array(dim=self.band_dim)
         elif isinstance(features, xr.DataArray):
@@ -281,17 +289,16 @@ class Sharpener:
         else:
             raise TypeError("features must be an xarray DataArray or Dataset.")
 
-        extra = [
-            d for d in da.dims
-            if d not in (self.band_dim, self.y_dim, self.x_dim)
-        ]
+        allowed = (self.band_dim, self.y_dim, self.x_dim, *extra_dims)
+        extra = [d for d in da.dims if d not in allowed]
         if extra:
             raise ValueError(
                 f"features has unexpected dimension(s) {extra}; the sharpener "
                 f"handles a single {self.band_dim}/{self.y_dim}/{self.x_dim} scene. "
                 "Select one step first, e.g. features.isel(time=0)."
             )
-        da = da.transpose(self.band_dim, self.y_dim, self.x_dim)
+        kept = [d for d in extra_dims if d in da.dims]
+        da = da.transpose(*kept, self.band_dim, self.y_dim, self.x_dim)
         if da.chunks is not None:
             # The regressor consumes all features of a pixel at once, so band is a
             # core dimension and must live in a single chunk. Converting a chunked
@@ -764,6 +771,76 @@ class Sharpener:
             return replace(st, residual_coarse=resid)
 
         return _attach(state, residual)
+
+    def scene_bundle(self, features, target):
+        """One scene's whole coarse half, computed now: ``(labels, state)``.
+
+        The eager twin of :meth:`scene_state`, and the piece
+        :func:`xr_dms.cube.sharpen_cube` defers one task at a time. Where
+        :meth:`scene_state` leaves the fit in the graph and lets dask decide when
+        to run it, this runs it here and hands back plain arrays -- which is what
+        lets the *caller's* graph be one task per scene rather than the thirty-odd
+        layers of ``delayed``/``from_delayed`` scaffolding that deferring each
+        piece separately costs.
+
+        Returns the fine-grid label array and a :class:`SceneState` whose
+        ``residual_coarse`` is already raveled to the 1-D form the gather indexes
+        into. An unfittable scene comes back with ``global_model=None`` and an
+        all-NaN residual rather than raising: by the time this runs the graph's
+        shape is fixed, so the failure has to be a value.
+
+        Requires ``window_size == 0`` and ``smooth_residual=False`` -- the cube
+        path applies the residual block-constant, which is the exactly
+        mass-conserving choice and the only one a bare label gather can express.
+        """
+        if self.window_size > 0:
+            raise NotImplementedError(
+                "scene_bundle does not support moving-window models "
+                "(window_size > 0); use fit()."
+            )
+        if self.smooth_residual:
+            raise NotImplementedError(
+                "scene_bundle applies the residual block-constant, so it needs "
+                "smooth_residual=False."
+            )
+
+        fine = self._as_features(features)
+        band_order = [str(b) for b in fine[self.band_dim].values]
+        self._setup_grid_map(fine, target)
+        labels = np.asarray(self.grid_map_.labels)
+        n_coarse = int(labels.max()) + 1 if labels.size else 0
+
+        prepared = self.grid_map_.prepare_target(target)
+        mean, y, cv = self._training_arrays(fine, prepared)
+        mean_arr = np.asarray(mean.values)
+        y_arr = np.asarray(y.values)
+        cv_arr = np.asarray(cv.values)
+
+        # Seeded for the same reason fit_delayed seeds: a bundle may be recomputed
+        # (a lost worker, a second .compute() of a neighbouring block), and the
+        # residual only conserves mass against the model it was measured from.
+        pure = copy.copy(self)
+        pure.regressor = self.regressor.seeded(_seed_from(mean_arr, y_arr, cv_arr))
+        result = pure._fit_region(
+            mean_arr, y_arr, cv_arr, slice(None), slice(None),
+            local=False, min_samples=1,
+        )
+        if result is None:
+            return labels, SceneState(
+                band_order=band_order,
+                residual_coarse=np.full(max(n_coarse, 1), np.nan),
+            )
+
+        model, threshold, n = result
+        state = SceneState(band_order, model, threshold, n)
+
+        guess = self.predict(fine, state=state)
+        guess_r = to_radiance(guess) if self.disaggregating_temperature else guess
+        obs = to_radiance(prepared) if self.disaggregating_temperature else prepared
+        residual = obs - self.grid_map_.aggregate_mean(guess_r)
+        residual = np.asarray(residual.values, dtype=float).ravel()
+
+        return labels, replace(state, residual_coarse=residual)
 
     def sharpen(self, features, target, lazy=False):
         """Fit, predict and residual-correct in one call (steps 1-5).
