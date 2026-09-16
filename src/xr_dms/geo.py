@@ -24,6 +24,8 @@ and CRS -- with ``NaN`` wherever the swath does not reach.
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import xarray as xr
 
@@ -33,6 +35,23 @@ from .aggregation import EPS
 from .gridmap import GridMap, WindowBasis
 
 __all__ = ["SwathGridMap"]
+
+#: Serialises every entry into Qhull, across the whole process.
+#:
+#: ``scipy.interpolate.LinearNDInterpolator`` is *not* safe to construct in one
+#: thread while another is evaluating a different one: Qhull keeps process-global
+#: scratch state, so the two interleave and the evaluation comes back subtly
+#: wrong -- measured at a few tenths of a Kelvin over a fraction of a percent of
+#: the fine grid, in different places every run. Constructing them concurrently
+#: is fine, and evaluating them concurrently is fine; it is only the mixture that
+#: corrupts, which is exactly what a cube of scenes does, one Delaunay per
+#: overpass against a fine grid tiled into blocks.
+#:
+#: The cost is that the scattered interpolation runs one thread at a time. That
+#: is a small share of DMS -- the regression and the aggregation, which are the
+#: expensive halves, stay parallel -- and the alternative is a sharpened field
+#: that is not a function of its inputs.
+_QHULL_LOCK = threading.Lock()
 
 #: Private coarse-namespace dim names. The swath's own ``y``/``x`` are scan row
 #: and column while the fine grid's are projected northing and easting; letting
@@ -518,6 +537,8 @@ class SwathGridMap(GridMap):
         Fine pixels outside the convex hull of the swath centres -- the outermost
         ~1% -- get the nearest coarse value instead, mirroring the ``ffill``/``bfill``
         edge extension of the regular-grid upsampler.
+
+        Qhull is entered under :data:`_QHULL_LOCK`; see there for why.
         """
         from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
@@ -527,7 +548,8 @@ class SwathGridMap(GridMap):
         ok = np.isfinite(pts).all(axis=1) & np.isfinite(values)
         if not ok.any():
             raise ValueError("No finite coarse values to upsample.")
-        lin = LinearNDInterpolator(pts[ok], values[ok])
+        with _QHULL_LOCK:
+            lin = LinearNDInterpolator(pts[ok], values[ok])
         near = NearestNDInterpolator(pts[ok], values[ok])
 
         ys = self._fine_coords[self.y_dim]
@@ -536,7 +558,8 @@ class SwathGridMap(GridMap):
         def _eval(y_block, x_block):
             xx, yy = np.meshgrid(x_block, y_block)
             q = np.column_stack([xx.ravel(), yy.ravel()])
-            out = lin(q)
+            with _QHULL_LOCK:
+                out = lin(q)
             gap = ~np.isfinite(out)
             if gap.any():
                 out[gap] = near(q[gap])

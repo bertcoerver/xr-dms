@@ -296,3 +296,34 @@ def test_hard_local_windows_survive_a_descending_axis():
     assert err_down == pytest.approx(err_up, rel=0.1), (
         "flipping the y axis must not change the sharpening skill"
     )
+
+
+def test_linear_upsample_is_a_function_of_its_inputs_under_threads():
+    """Qhull must not be entered from two threads at once.
+
+    Building a ``LinearNDInterpolator`` while another one is being evaluated
+    returns subtly wrong values -- a few tenths of a Kelvin over a fraction of a
+    percent of the grid, somewhere different every run. A cube does exactly that:
+    one Delaunay per overpass, evaluated block by block. The lock in
+    :mod:`xr_dms.geo` is what makes this deterministic; without it this test
+    fails most runs.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    features, _, _, gm = make_swath_scene()
+    like = features.to_array("band").isel(band=0, drop=True).chunk({"y": 32, "x": 32})
+    n_coarse = int(np.prod(gm.coarse_shape))
+    fields = [
+        gm._to_coarse_da(np.linspace(0, 1, n_coarse) * scale)
+        for scale in (1.0, 2.0, 3.0, 4.0)
+    ]
+
+    def up(field):
+        return np.asarray(gm.upsample(field, like, method="linear").values)
+
+    expected = [up(f) for f in fields]
+    for _ in range(3):
+        with ThreadPoolExecutor(len(fields)) as pool:
+            got = list(pool.map(up, fields))
+        for a, b in zip(expected, got):
+            np.testing.assert_array_equal(a, b)

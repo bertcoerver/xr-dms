@@ -21,7 +21,7 @@ from scenes import make_swath_scene
 PINNED = dict(regressor_opt={"random_state": 0}, bagging_opt={"random_state": 0})
 
 
-def _sharpener(grid_map):
+def _sharpener(grid_map, smooth=False):
     """A sharpener with the bootstrap pinned, so two fits are comparable.
 
     The default regressor bags decision trees off the global RNG, which moves the
@@ -32,7 +32,7 @@ def _sharpener(grid_map):
         grid_map=grid_map,
         regressor=SklearnDMSRegressor(**PINNED),
         disaggregating_temperature=True,
-        smooth_residual=False,
+        smooth_residual=smooth,
     )
 
 
@@ -42,7 +42,7 @@ def swath():
     return features, target, grid_map
 
 
-def _cube(swath, n_scenes, chunk=64):
+def _cube(swath, n_scenes, chunk=64, smooth=False):
     """``n_scenes`` copies of one scene, offset so they are not identical."""
     features, target, grid_map = swath
     times = np.arange(n_scenes).astype("datetime64[D]").astype("datetime64[ns]")
@@ -52,7 +52,7 @@ def _cube(swath, n_scenes, chunk=64):
     targets = [target + 0.05 * i for i in range(n_scenes)]
 
     def bundle(i):
-        return _sharpener(grid_map).scene_bundle(
+        return _sharpener(grid_map, smooth).scene_bundle(
             features + 0.01 * i, targets[i],
         )
 
@@ -189,8 +189,67 @@ def test_rejects_a_scene_count_mismatch(swath):
         sharpen_cube(_sharpener(gm), stack, [(0,)], bundle)
 
 
-def test_rejects_smoothed_residual(swath):
-    stack, _, gm, bundle = _cube(swath, 1)
-    sharpener = Sharpener(grid_map=gm, smooth_residual=True)
-    with pytest.raises(NotImplementedError, match="smooth_residual=False"):
-        sharpen_cube(sharpener, stack, [(0,)], bundle)
+def test_smoothed_residual_matches_the_per_scene_path(swath):
+    """``smooth_residual=True`` must also agree with Sharpener.sharpen.
+
+    The bundle smooths and interpolates the residual itself rather than handing
+    out labels, so this is a different code path through the cube -- but the
+    numbers have to be the per-scene ones, wherever the observation has coverage.
+    """
+    features, target, grid_map = swath
+    stack, targets, gm, _ = _cube(swath, 2, smooth=True)
+
+    def bundle(i):
+        return _sharpener(gm, smooth=True).scene_bundle(
+            features + 0.01 * i, targets[i],
+        )
+
+    cube = sharpen_cube(
+        _sharpener(gm, smooth=True), stack, [(i,) for i in range(2)], bundle,
+    ).compute()
+
+    for i in range(2):
+        expected = _sharpener(gm, smooth=True).sharpen(
+            features + 0.01 * i, targets[i],
+        ).compute()
+        got = cube.isel(time=i).values
+        # The cube path keeps the block-constant path's coverage; the per-scene
+        # path lets the interpolation run past it. Compare where both are defined.
+        both = np.isfinite(got) & np.isfinite(expected.values)
+        assert both.mean() > 0.5
+        np.testing.assert_allclose(
+            got[both], expected.values[both], rtol=1e-9, atol=1e-9,
+        )
+
+
+def test_smoothed_residual_removes_the_coarse_cell_edges(swath):
+    """The point of the smoothed residual: no coarse cell geometry in the output.
+
+    Measured on the *correction* rather than on the sharpened field, because the
+    first guess carries fine-scale texture of its own that swamps the difference,
+    and in radiance space because that is where the correction is actually added
+    (``disaggregating_temperature``) and so where it is exactly the residual.
+
+    The statistic is the 99th percentile of the neighbour difference, not the
+    mean: total variation is roughly conserved when a step is spread over a
+    cell's width, so the mean barely moves. What changes is where that variation
+    sits -- block-constant puts all of it in the ~5% of pixel pairs that straddle
+    a cell edge and leaves the rest exactly flat, which is what the eye picks out
+    as the coarse grid.
+    """
+    features, target, grid_map = swath
+
+    def edge_jump(a):
+        return np.nanpercentile(np.abs(np.diff(a, axis=-1)), 99)
+
+    fitted = _sharpener(grid_map).fit(features, target)
+    guess = fitted.first_guess(features, target).compute().values
+
+    blocky = _sharpener(grid_map).sharpen(features, target).compute().values
+    smooth = _sharpener(grid_map, smooth=True).sharpen(
+        features, target,
+    ).compute().values
+
+    assert edge_jump(smooth ** 4 - guess ** 4) < edge_jump(
+        blocky ** 4 - guess ** 4
+    ) / 5

@@ -154,18 +154,40 @@ def upsample(coarse, like, x_dim="x", y_dim="y", method="linear"):
 def binomial_smooth(coarse, x_dim="x", y_dim="y"):
     """3x3 binomial (1-2-1)(1-2-1) smoothing with edge padding.
 
-    Ports pyDMS ``binomialSmoother``: the coarse residual is smoothed before
-    being upsampled so the correction field is gentle rather than blocky. The
-    coarse grid is small, so this runs eagerly on the underlying array.
+    Ports pyDMS ``binomialSmoother``, including its NaN handling: a missing
+    neighbour is *left out* of the average and the remaining weights are
+    renormalised, and a missing centre stays missing. A plain convolution would
+    instead let every gap in the coarse residual -- a cloudy cell, a cell the
+    fine grid barely covers -- eat its eight neighbours, so one run of the
+    smoother would widen every hole by a pixel on all sides.
+
+    The renormalisation is exact rather than an approximation of the 3x3 filter:
+    the 9-point kernel is the outer product of ``[1, 2, 1]`` with itself, so
+    smoothing the masked values and the mask separably and dividing gives the
+    same answer as the 2-D weighted filter.
+
+    The coarse grid is small, so this runs eagerly on the underlying array.
     """
     from scipy.ndimage import correlate1d
 
     weights = np.array([0.25, 0.5, 0.25])
     axes = {d: i for i, d in enumerate(coarse.dims)}
     values = np.asarray(coarse.values, dtype=float)
+
+    present = np.isfinite(values)
+    numerator = np.where(present, values, 0.0)
+    denominator = present.astype(float)
     for dim in (y_dim, x_dim):
-        values = correlate1d(values, weights, axis=axes[dim], mode="nearest")
-    return coarse.copy(data=values)
+        numerator = correlate1d(numerator, weights, axis=axes[dim], mode="nearest")
+        denominator = correlate1d(
+            denominator, weights, axis=axes[dim], mode="nearest"
+        )
+
+    smoothed = np.divide(
+        numerator, denominator,
+        out=np.full_like(numerator, np.nan), where=denominator > 0,
+    )
+    return coarse.copy(data=np.where(present, smoothed, np.nan))
 
 
 def window_basis_1d(coords, centers, edges, smooth):

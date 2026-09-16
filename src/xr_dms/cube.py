@@ -18,7 +18,11 @@ many scenes are in it. The split is the one DMS already has:
   this ever culled spatially in the first place; a global regression needs global
   statistics.
 * **three blockwise operations over the whole cube** cover the fine half --
-  predict, gather the residual, add. One layer each, for every scene at once.
+  predict, get the residual onto the fine grid, add. One layer each, for every
+  scene at once. With ``smooth_residual=False`` the middle step is a gather
+  through a label array; with ``smooth_residual=True`` the bundle has already
+  smoothed and interpolated the residual, so there is nothing left to do but
+  rechunk it.
 
 The consequence worth knowing about is that the scene-global half is now opaque
 to the graph: the swath read happens inside the task, so nothing outside it needs
@@ -44,14 +48,14 @@ def _scene_bundle_block(bundle, *args):
     """One scene's coarse half, shaped as one block of each output array.
 
     Module level so it pickles by reference. ``bundle`` returns
-    ``(labels, state)``; this adds the leading scene axis and splits the coarse
+    ``(gather, state)``; this adds the leading scene axis and splits the coarse
     residual out of the state, because the three travel as arrays of different
     shape (see :func:`~xr_dms._graph.bundled_arrays`).
     """
-    labels, state = bundle(*args)
+    gather, state = bundle(*args)
     residual = np.asarray(state.residual_coarse, dtype=float).ravel()
     return (
-        np.asarray(labels)[None],
+        np.asarray(gather)[None],
         np.array([state], dtype=object),
         residual[None],
     )
@@ -103,8 +107,10 @@ def sharpen_cube(sharpener, features, scene_args, bundle,
         One entry per scene, in ``features[time_dim]`` order, holding the
         positional arguments for ``bundle``.
     bundle : callable
-        ``bundle(*args) -> (labels, state)`` for one scene, as
-        :meth:`~xr_dms.sharpener.Sharpener.scene_bundle` returns. Called inside
+        ``bundle(*args) -> (gather, state)`` for one scene, as
+        :meth:`~xr_dms.sharpener.Sharpener.scene_bundle` returns -- and it must
+        agree with ``sharpener`` about ``smooth_residual``, since that decides
+        whether ``gather`` is a label array or the fine residual. Called inside
         the graph, once per scene, and must be picklable and pure -- dask offers
         no guarantee that a task runs only once, and a residual measured against
         one model but applied to another silently stops conserving mass.
@@ -121,12 +127,6 @@ def sharpen_cube(sharpener, features, scene_args, bundle,
             "sharpen_cube does not support moving-window models "
             "(window_size > 0); use Sharpener.sharpen()."
         )
-    if sharpener.smooth_residual:
-        raise NotImplementedError(
-            "sharpen_cube applies the residual block-constant; it needs "
-            "smooth_residual=False."
-        )
-
     import dask.array as dsa
 
     fine = sharpener._as_features(features, extra_dims=(time_dim,))
@@ -150,12 +150,17 @@ def sharpen_cube(sharpener, features, scene_args, bundle,
             f"(got chunks {time_chunks}); each scene has its own model."
         )
 
+    # Whether the bundle hands back labels to index the coarse residual with or
+    # the smoothed residual already on the fine grid; either way it is one
+    # fine-shaped array per scene, so only the dtype changes here.
+    smooth = sharpener.smooth_residual
+
     ny, nx = fine.sizes[y_dim], fine.sizes[x_dim]
-    labels, states, residual = bundled_arrays(
+    gather, states, residual = bundled_arrays(
         task_group, _scene_bundle_block,
         {(t,): tuple(args) for t, args in enumerate(scene_args)},
         [
-            (((1,) * n_scenes, (ny,), (nx,)), np.int64),
+            (((1,) * n_scenes, (ny,), (nx,)), float if smooth else np.int64),
             (((1,) * n_scenes,), object),
             (((1,) * n_scenes, (np.nan,)), float),
         ],
@@ -175,17 +180,18 @@ def sharpen_cube(sharpener, features, scene_args, bundle,
         output_dtypes=[float],
     )
 
-    # The labels come out of one task per scene, so they arrive whole; rechunking
-    # to the fine grid is what makes the gather blockwise rather than a single
-    # 110 MB block travelling to every worker.
+    # The bundle's fine-shaped output comes out of one task per scene, so it
+    # arrives whole; rechunking to the fine grid is what keeps the rest blockwise
+    # rather than sending a single 110 MB block to every worker.
     fine_chunks = (
         (1,) * n_scenes,
         fine.chunks[fine.dims.index(y_dim)],
         fine.chunks[fine.dims.index(x_dim)],
     )
-    residual_fine = dsa.blockwise(
+    gather = gather.rechunk(fine_chunks)
+    residual_fine = gather if smooth else dsa.blockwise(
         _gather_scene_block, "tyx",
-        labels.rechunk(fine_chunks), "tyx",
+        gather, "tyx",
         residual, "tc",
         concatenate=True, dtype=float,
     )

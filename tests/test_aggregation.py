@@ -1,8 +1,14 @@
 """Tests for the native aggregation primitives."""
 
 import numpy as np
+import xarray as xr
 
-from xr_dms.aggregation import coarsen_mean_std, homogeneity_cv, upsample
+from xr_dms.aggregation import (
+    binomial_smooth,
+    coarsen_mean_std,
+    homogeneity_cv,
+    upsample,
+)
 
 
 def _np_block(arr, factor, reduce):
@@ -44,3 +50,25 @@ def test_upsample_shape_and_no_nans(scene):
     # Upsampled values stay within the coarse data range (+ tiny tolerance).
     assert up.min() >= target.min() - 1e-6
     assert up.max() <= target.max() + 1e-6
+
+
+def test_binomial_smooth_does_not_spread_gaps():
+    """pyDMS's smoother skips missing neighbours; a plain convolution eats them.
+
+    The coarse residual is full of gaps -- a cloudy cell, a cell the fine grid
+    barely covers -- and a smoother that let NaN win would widen every one of
+    them by a pixel on all sides each time it ran.
+    """
+    values = np.ones((7, 7))
+    values[3, 3] = np.nan
+    coarse = xr.DataArray(values, dims=("y", "x"))
+
+    out = binomial_smooth(coarse)
+
+    assert np.isnan(out.values[3, 3]), "a missing centre must stay missing"
+    gap = np.zeros_like(values, dtype=bool)
+    gap[3, 3] = True
+    assert np.isfinite(out.values[~gap]).all(), "the gap must not have spread"
+    # Renormalising over the present neighbours means a constant field is
+    # reproduced exactly, gap or no gap.
+    np.testing.assert_allclose(out.values[~gap], 1.0)

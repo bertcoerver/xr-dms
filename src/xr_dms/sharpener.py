@@ -772,8 +772,34 @@ class Sharpener:
 
         return _attach(state, residual)
 
+    def _smoothed_residual_fine(self, residual_coarse, labels, like):
+        """The coarse residual smoothed, interpolated and put on the fine grid.
+
+        The :meth:`scene_bundle` counterpart of the ``smooth_residual=True``
+        branch of :meth:`residual_correct`, materialised: pyDMS's binomial
+        smoother followed by a bilinear (here: scattered-linear) upsample, which
+        is what keeps the correction from carrying the coarse cell geometry into
+        the sharpened field.
+
+        The observation footprint is *preserved*. Interpolating over the swath
+        centres fills the gaps the coarse grid has -- a cloudy cell, a cell the
+        fine grid barely covers -- and a filled cloud gap is an invented surface
+        temperature, not a sharpened one. So the interpolated field is masked
+        back to the cells a block-constant gather would have given a value,
+        leaving the result with exactly the coverage the block-constant path had
+        and differing from it only in the values.
+        """
+        cy, cx = self.grid_map_.coarse_dims
+        smoothed = binomial_smooth(residual_coarse, cx, cy)
+        fine = self.grid_map_.upsample(smoothed, like, method="linear")
+        fine = np.asarray(fine.values, dtype=float)
+
+        flat = np.asarray(residual_coarse.values, dtype=float).ravel()
+        observed = np.isfinite(np.append(flat, np.nan)[labels])
+        return np.where(observed, fine, np.nan)
+
     def scene_bundle(self, features, target):
-        """One scene's whole coarse half, computed now: ``(labels, state)``.
+        """One scene's whole coarse half, computed now: ``(gather, state)``.
 
         The eager twin of :meth:`scene_state`, and the piece
         :func:`xr_dms.cube.sharpen_cube` defers one task at a time. Where
@@ -783,25 +809,28 @@ class Sharpener:
         layers of ``delayed``/``from_delayed`` scaffolding that deferring each
         piece separately costs.
 
-        Returns the fine-grid label array and a :class:`SceneState` whose
-        ``residual_coarse`` is already raveled to the 1-D form the gather indexes
-        into. An unfittable scene comes back with ``global_model=None`` and an
-        all-NaN residual rather than raising: by the time this runs the graph's
-        shape is fixed, so the failure has to be a value.
+        ``gather`` is how the fine half is to get at the residual, and which of
+        the two forms it takes is :attr:`smooth_residual`'s doing:
 
-        Requires ``window_size == 0`` and ``smooth_residual=False`` -- the cube
-        path applies the residual block-constant, which is the exactly
-        mass-conserving choice and the only one a bare label gather can express.
+        * ``smooth_residual=False`` -- the fine-grid **label** array, an index
+          into the 1-D ``state.residual_coarse``. Block-constant, and so exactly
+          mass-conserving, at the cost of a step at every coarse cell edge.
+        * ``smooth_residual=True`` -- the smoothed, interpolated **residual
+          itself**, already on the fine grid (see
+          :meth:`_smoothed_residual_fine`). The pyDMS correction: gentle, only
+          approximately conserving, and free of the coarse cell geometry.
+
+        Either way the state's ``residual_coarse`` is raveled to 1-D. An
+        unfittable scene comes back with ``global_model=None`` and an all-NaN
+        residual rather than raising: by the time this runs the graph's shape is
+        fixed, so the failure has to be a value.
+
+        Requires ``window_size == 0``.
         """
         if self.window_size > 0:
             raise NotImplementedError(
                 "scene_bundle does not support moving-window models "
                 "(window_size > 0); use fit()."
-            )
-        if self.smooth_residual:
-            raise NotImplementedError(
-                "scene_bundle applies the residual block-constant, so it needs "
-                "smooth_residual=False."
             )
 
         fine = self._as_features(features)
@@ -826,7 +855,12 @@ class Sharpener:
             local=False, min_samples=1,
         )
         if result is None:
-            return labels, SceneState(
+            # An unfittable scene's gather has to have the dtype the caller's
+            # graph declared for it, which follows smooth_residual either way.
+            gather = (
+                np.full(labels.shape, np.nan) if self.smooth_residual else labels
+            )
+            return gather, SceneState(
                 band_order=band_order,
                 residual_coarse=np.full(max(n_coarse, 1), np.nan),
             )
@@ -838,9 +872,14 @@ class Sharpener:
         guess_r = to_radiance(guess) if self.disaggregating_temperature else guess
         obs = to_radiance(prepared) if self.disaggregating_temperature else prepared
         residual = obs - self.grid_map_.aggregate_mean(guess_r)
+
+        gather = (
+            self._smoothed_residual_fine(residual, labels, fine)
+            if self.smooth_residual else labels
+        )
         residual = np.asarray(residual.values, dtype=float).ravel()
 
-        return labels, replace(state, residual_coarse=residual)
+        return gather, replace(state, residual_coarse=residual)
 
     def sharpen(self, features, target, lazy=False):
         """Fit, predict and residual-correct in one call (steps 1-5).
