@@ -548,8 +548,18 @@ class SwathGridMap(GridMap):
         ok = np.isfinite(pts).all(axis=1) & np.isfinite(values)
         if not ok.any():
             raise ValueError("No finite coarse values to upsample.")
-        with _QHULL_LOCK:
-            lin = LinearNDInterpolator(pts[ok], values[ok])
+        # Fewer than three finite centres, or centres on one line, span no
+        # triangle -- a scene the cloud mask left a sliver of. Every fine pixel
+        # then takes the nearest coarse value, as the ones outside the hull do.
+        lin = None
+        if ok.sum() >= 3:
+            from scipy.spatial import QhullError
+
+            try:
+                with _QHULL_LOCK:
+                    lin = LinearNDInterpolator(pts[ok], values[ok])
+            except QhullError:
+                lin = None
         near = NearestNDInterpolator(pts[ok], values[ok])
 
         ys = self._fine_coords[self.y_dim]
@@ -558,6 +568,8 @@ class SwathGridMap(GridMap):
         def _eval(y_block, x_block):
             xx, yy = np.meshgrid(x_block, y_block)
             q = np.column_stack([xx.ravel(), yy.ravel()])
+            if lin is None:
+                return near(q).reshape(xx.shape)
             with _QHULL_LOCK:
                 out = lin(q)
             gap = ~np.isfinite(out)
