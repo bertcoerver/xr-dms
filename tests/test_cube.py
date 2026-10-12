@@ -12,7 +12,7 @@ import xarray as xr
 
 import dask
 
-from xr_dms import Sharpener, SklearnDMSRegressor
+from xr_dms import BaseRegressor, Sharpener, SklearnDMSRegressor
 from xr_dms.cube import sharpen_cube
 
 from scenes import make_swath_scene
@@ -174,6 +174,45 @@ def test_unfittable_scene_is_all_nan_not_an_exception(swath):
 
     out = sharpen_cube(_sharpener(gm), stack, [(0,)], bundle).compute()
     assert np.isnan(out.values).all()
+
+
+class _NaNRegressor(BaseRegressor):
+    """Fits, then predicts NaN everywhere, as a fit gone wrong would."""
+
+    def fit(self, X, y, sample_weight=None):
+        return self
+
+    def predict(self, X):
+        return np.full(X.shape[0], np.nan)
+
+
+@pytest.mark.parametrize("smooth", [True, False])
+def test_a_residual_with_no_finite_value_is_all_nan_not_an_exception(swath, smooth):
+    """A fit that succeeds but leaves nothing to correct is unfittable too.
+
+    The smoothed path used to raise "No finite coarse values to upsample." out
+    of the interpolation, taking every other scene of the write down with it;
+    the block-constant one gave the NaN slab but called the scene fitted.
+    """
+    features, target, grid_map = swath
+    stack, targets, gm, _ = _cube(swath, 2, smooth=smooth)
+
+    def bundle(i):
+        regressor = _NaNRegressor() if i == 0 else SklearnDMSRegressor(**PINNED)
+        return Sharpener(
+            grid_map=gm, regressor=regressor, disaggregating_temperature=True,
+            smooth_residual=smooth,
+        ).scene_bundle(features + 0.01 * i, targets[i])
+
+    out = sharpen_cube(
+        _sharpener(gm, smooth), stack, [(0,), (1,)], bundle,
+    ).compute()
+    assert np.isnan(out.isel(time=0).values).all()
+    assert np.isfinite(out.isel(time=1).values).mean() > 0.9
+
+    _, state = bundle(0)
+    assert not state.fitted
+    assert "no finite value" in state.reason
 
 
 def test_rejects_a_time_axis_chunked_wider_than_one_scene(swath):

@@ -104,16 +104,33 @@ class DecisionTreeRegressorWithLinearLeafRegression(tree.DecisionTreeRegressor):
         prediction may extrapolate beyond the observed min/max.
     decision_tree_regressor_opt : dict, optional
         Keyword options forwarded to :class:`~sklearn.tree.DecisionTreeRegressor`.
+    random_state : int, RandomState or None, default None
+        The tree's own RNG, which orders the candidate features at every split
+        and so breaks ties between them. ``None`` keeps whatever
+        ``decision_tree_regressor_opt`` says, which is the global RNG unless it
+        says otherwise.
+
+        It is a constructor argument, rather than only an entry of
+        ``decision_tree_regressor_opt``, because that is the only place
+        scikit-learn looks: :class:`~sklearn.ensemble.BaggingRegressor` seeds each
+        of its trees through ``set_params(random_state=...)``, finding the
+        parameter with ``get_params()``, which reads ``__init__``'s signature.
+        Without it here the bagging seed never reached a tree, and two fits of
+        one test scene under one seed differed by up to 4 K, from the pixels
+        where two features tied at a split.
     """
 
     def __init__(self, linear_regression_extrapolation_ratio=0.25,
-                 decision_tree_regressor_opt=None):
-        opt = decision_tree_regressor_opt or {}
-        super().__init__(**opt)
-        self.decision_tree_regressor_opt = opt
+                 decision_tree_regressor_opt=None, random_state=None):
+        super().__init__(**(decision_tree_regressor_opt or {}))
+        # Stored as given, not as the `or {}` above: scikit-learn's clone checks
+        # that every constructor argument comes back as the very same object.
+        self.decision_tree_regressor_opt = decision_tree_regressor_opt
         self.linear_regression_extrapolation_ratio = (
             linear_regression_extrapolation_ratio
         )
+        if random_state is not None:
+            self.random_state = random_state
         self.leaf_parameters = {}
 
     def fit(self, X, y, sample_weight=None, **fit_opt):
@@ -213,12 +230,18 @@ class SklearnDMSRegressor(BaseRegressor):
         )
 
     def seeded(self, seed: int) -> "SklearnDMSRegressor":
-        """Pin the bootstrap RNG so a deferred fit is a pure function.
+        """Pin every random draw of the fit so a deferred fit is a pure function.
 
-        :class:`~sklearn.ensemble.BaggingRegressor` draws its bootstrap samples
-        from numpy's global RNG unless told otherwise, which makes two fits of
-        identical data differ by a couple of Kelvin here. See
+        Two draws, both from numpy's global RNG unless told otherwise: the
+        bootstraps of :class:`~sklearn.ensemble.BaggingRegressor`, and each tree's
+        ordering of the candidate features at a split, which decides ties between
+        them. Either makes two fits of identical data differ by Kelvin here. See
         :meth:`BaseRegressor.seeded` for why a dask graph cannot tolerate that.
+
+        Pinning the bagging seed pins both: the ensemble hands each tree a seed of
+        its own drawn from it (see
+        :class:`DecisionTreeRegressorWithLinearLeafRegression`'s
+        ``random_state``), overriding any ``random_state`` in ``regressor_opt``.
 
         An explicit ``random_state`` in ``bagging_opt`` always wins -- if the
         caller has pinned the seed they have already made the fit pure, and
