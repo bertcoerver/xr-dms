@@ -54,9 +54,9 @@ class SceneState:
     cached to disk so a later run's fine half is pure blockwise -- which is the
     difference between a spatial subset costing one chunk and costing a scene.
 
-    ``global_model=None`` records a scene that could not be fitted (no
-    homogeneous training pixels). Applying such a state yields all-NaN rather
-    than raising, because a lazy graph cannot change its own shape.
+    ``global_model=None`` records a scene that could not be fitted, and
+    :attr:`reason` says why. Applying such a state yields all-NaN rather than
+    raising, because a lazy graph cannot change its own shape.
     """
 
     band_order: list[str]
@@ -66,6 +66,9 @@ class SceneState:
     #: Coarse residual, in whichever space the correction is applied. When set,
     #: :meth:`Sharpener.apply` needs no scene-global reduction at all.
     residual_coarse: Any = None
+    #: Why an unfitted scene is unfitted, for the caller to report; empty for a
+    #: fitted one.
+    reason: str = ""
 
     @property
     def fitted(self):
@@ -415,7 +418,9 @@ class Sharpener:
                 mean_arr, y_arr, cv_arr, *full, local=False, min_samples=1,
             )
             if result is None:
-                return SceneState(band_order=band_order)
+                return SceneState(
+                    band_order=band_order, reason="no homogeneous training pixels",
+                )
             model, threshold, n = result
             return SceneState(band_order, model, threshold, n)
 
@@ -821,9 +826,11 @@ class Sharpener:
           approximately conserving, and free of the coarse cell geometry.
 
         Either way the state's ``residual_coarse`` is raveled to 1-D. An
-        unfittable scene comes back with ``global_model=None`` and an all-NaN
-        residual rather than raising: by the time this runs the graph's shape is
-        fixed, so the failure has to be a value.
+        unfittable scene comes back with ``global_model=None``, an all-NaN
+        residual and a :attr:`SceneState.reason` rather than raising: by the time
+        this runs the graph's shape is fixed, so the failure has to be a value.
+        A scene whose fit succeeded but whose residual has no finite value is one
+        of those too.
 
         Requires ``window_size == 0``.
         """
@@ -854,7 +861,8 @@ class Sharpener:
             mean_arr, y_arr, cv_arr, slice(None), slice(None),
             local=False, min_samples=1,
         )
-        if result is None:
+
+        def unfitted(reason):
             # An unfittable scene's gather has to have the dtype the caller's
             # graph declared for it, which follows smooth_residual either way.
             gather = (
@@ -863,7 +871,11 @@ class Sharpener:
             return gather, SceneState(
                 band_order=band_order,
                 residual_coarse=np.full(max(n_coarse, 1), np.nan),
+                reason=reason,
             )
+
+        if result is None:
+            return unfitted("no homogeneous training pixels")
 
         model, threshold, n = result
         state = SceneState(band_order, model, threshold, n)
@@ -871,7 +883,29 @@ class Sharpener:
         guess = self.predict(fine, state=state)
         guess_r = to_radiance(guess) if self.disaggregating_temperature else guess
         obs = to_radiance(prepared) if self.disaggregating_temperature else prepared
-        residual = obs - self.grid_map_.aggregate_mean(guess_r)
+        # Computed once here: the smoothing, the footprint mask and the state
+        # below each read it, and each read of a lazy one predicts the scene anew.
+        guess_coarse = self.grid_map_.aggregate_mean(guess_r).compute()
+        residual = obs - guess_coarse
+
+        if not np.isfinite(residual.values).any():
+            # The model trained on finite cells, so its residual is finite on
+            # those same cells unless its predictions are not. Nothing can be
+            # corrected then, and the smoothing has nothing to interpolate: the
+            # scene is as unfittable as one with no training pixels, and is
+            # reported the same way rather than taking the whole cube down.
+            # Said with enough to tell a broken fit from a broken read.
+            X = mean_arr.reshape(-1, mean_arr.shape[-1])
+            X = X[np.all(np.isfinite(X), axis=1)]
+            own = np.isfinite(model.predict(X)).mean() if len(X) else np.nan
+            return unfitted(
+                f"the residual against the fitted model ({n} training pixels) "
+                f"has no finite value: {int(np.isfinite(guess_coarse.values).sum())} "
+                f"of {guess_coarse.size} coarse cells have a finite first guess and "
+                f"{int(np.isfinite(obs.values).sum())} a finite observation, and "
+                f"the model predicts {own:.0%} of the coarse features it was "
+                "trained from as finite"
+            )
 
         gather = (
             self._smoothed_residual_fine(residual, labels, fine)

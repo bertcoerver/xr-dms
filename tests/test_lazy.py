@@ -6,7 +6,9 @@ deferring change the numbers (it must not), and does deferring actually defer
 (nothing may run until ``compute``).
 
 The default regressor bags decision trees without a fixed seed, so two fits of
-the same data differ by a couple of Kelvin. Every comparison below therefore
+the same data differ by a couple of Kelvin. The deferred paths seed it from the
+training data (:meth:`BaseRegressor.seeded`), but the eager path the lazy one is
+compared against does not. Every comparison below therefore
 pins ``random_state`` -- without it these tests would compare the regressor's
 noise, not the code path.
 """
@@ -314,6 +316,46 @@ def test_the_deferred_fit_is_a_pure_function(swath_lazy):
         first.global_model.predict(np.eye(3)),
         second.global_model.predict(np.eye(3)),
     )
+
+
+def test_a_scene_sharpens_the_same_twice_unpinned():
+    """The seed :meth:`Sharpener.scene_bundle` derives has to pin every draw.
+
+    The bootstraps were seeded; the trees were not, since the bagging seed
+    reaches a tree only through a ``random_state`` in its constructor. A tree
+    orders its candidate features at random and keeps the first of two that tie,
+    and a feature that is a monotone transform of another -- LAI of NDVI, as a
+    recipe's features are -- ties at nearly every split. This scene, with that
+    one feature added, differed by 4 K between the two fits below.
+
+    The global RNG is set differently before each fit, so nothing it supplies
+    can agree by luck.
+    """
+    features, target, _, gm = make_swath_scene(fine_shape=(150, 150))
+    features = features.assign(lai=-np.log(np.clip(1 - features["ndvi"], 0.05, 1)))
+
+    def sharpened(global_seed):
+        np.random.seed(global_seed)
+        sharpener = Sharpener(grid_map=gm, disaggregating_temperature=True)
+        gather, state = sharpener.scene_bundle(features, target)
+        guess = sharpener.predict(features, state=state).values
+        return (guess ** 4 + gather) ** 0.25
+
+    first, second = sharpened(1), sharpened(2)
+    assert np.isfinite(first).mean() > 0.9
+    np.testing.assert_array_equal(first, second)
+
+
+def test_the_bagging_seed_reaches_every_tree():
+    """Each tree of a seeded ensemble has a seed of its own, per-leaf or plain."""
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((200, 3))
+    y = X[:, 0] + 0.1 * rng.standard_normal(200)
+    for per_leaf in (True, False):
+        reg = SklearnDMSRegressor(per_leaf_linear_regression=per_leaf).seeded(5)
+        seeds = [t.random_state for t in reg.fit(X, y)._model.estimators_]
+        assert all(isinstance(s, int) for s in seeds), seeds
+        assert len(set(seeds)) == len(seeds), "the trees share a seed"
 
 
 def test_an_explicit_random_state_is_not_overridden():
