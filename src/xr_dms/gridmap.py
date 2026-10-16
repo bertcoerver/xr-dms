@@ -152,7 +152,7 @@ class RegularGridMap(GridMap):
     """
 
     def __init__(self, factor, coarse_shape, coarse_coords, x_dim="x", y_dim="y",
-                 boundary="exact"):
+                 boundary="exact", fine_shape=None):
         self.factor = int(factor)
         self.coarse_shape = tuple(coarse_shape)
         self._coarse_coords = coarse_coords
@@ -160,6 +160,10 @@ class RegularGridMap(GridMap):
         self.y_dim = y_dim
         self.boundary = boundary
         self.coarse_dims = (y_dim, x_dim)
+        # The fine grid's own shape, which "trim" lets exceed the blocks.
+        self.fine_shape = tuple(fine_shape) if fine_shape is not None else tuple(
+            n * self.factor for n in self.coarse_shape
+        )
 
     @classmethod
     def from_grids(cls, fine, target, x_dim="x", y_dim="y", boundary="exact"):
@@ -174,7 +178,24 @@ class RegularGridMap(GridMap):
             coarse_shape=(target.sizes[y_dim], target.sizes[x_dim]),
             coarse_coords=coarse_coords,
             x_dim=x_dim, y_dim=y_dim, boundary=boundary,
+            fine_shape=(fine.sizes[y_dim], fine.sizes[x_dim]),
         )
+
+    @property
+    def labels(self):
+        """Per fine pixel, the flat index of its coarse pixel (row-major), as
+        :class:`~xr_dms.SwathGridMap` has it: ``-1`` for the fine edge a
+        ``"trim"`` boundary leaves outside every block.
+
+        What :meth:`Sharpener.scene_bundle` gathers the coarse residual with, so
+        a co-registered coarse raster goes through the same per-scene path as a
+        swath.
+        """
+        ny, nx = self.coarse_shape
+        rows = np.arange(self.fine_shape[0]) // self.factor
+        cols = np.arange(self.fine_shape[1]) // self.factor
+        inside = (rows[:, None] < ny) & (cols[None, :] < nx)
+        return np.where(inside, rows[:, None] * nx + cols[None, :], -1).astype(np.int64)
 
     def _match_coarse_coords(self, coarse):
         """Assign the target's spatial coords onto a coarsened array.

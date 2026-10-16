@@ -292,3 +292,75 @@ def test_smoothed_residual_removes_the_coarse_cell_edges(swath):
     assert edge_jump(smooth ** 4 - guess ** 4) < edge_jump(
         blocky ** 4 - guess ** 4
     ) / 5
+
+
+# -- moving windows -----------------------------------------------------------
+def _windowed(grid_map=None, smooth=True, window_size=5):
+    """:func:`_sharpener` with local models, Gao (2012) section 2.3."""
+    return Sharpener(
+        grid_map=grid_map,
+        regressor=SklearnDMSRegressor(**PINNED),
+        disaggregating_temperature=True,
+        smooth_residual=smooth,
+        window_size=window_size,
+    )
+
+
+def _windowed_cube(fine, targets, make):
+    times = np.arange(len(targets)).astype("datetime64[D]").astype("datetime64[ns]")
+    stack = xr.concat(
+        [fine + 0.01 * i for i in range(len(targets))], dim="time",
+    ).assign_coords(time=times).chunk({"time": 1, "y": 40, "x": 40})
+
+    def bundle(i):
+        return make().scene_bundle(fine + 0.01 * i, targets[i])
+
+    return sharpen_cube(
+        make(), stack, [(i,) for i in range(len(targets))], bundle,
+    ).compute()
+
+
+@pytest.mark.parametrize("smooth", [True, False])
+def test_moving_windows_match_the_per_scene_path_on_a_raster(varying_scene, smooth):
+    """A co-registered coarse raster with local models: the cube is sharpen()."""
+    features, target, _, _ = varying_scene
+    fine = features.to_dataset("band")
+    targets = [target + 0.05 * i for i in range(2)]
+    make = lambda: _windowed(smooth=smooth)
+
+    cube = _windowed_cube(fine, targets, make)
+
+    assert make().fit(fine, targets[0])._has_local_models()
+    for i in range(2):
+        expected = make().sharpen(fine + 0.01 * i, targets[i]).compute()
+        np.testing.assert_allclose(
+            cube.isel(time=i).values, expected.values, rtol=1e-9, atol=1e-6,
+        )
+
+
+def test_moving_windows_match_the_per_scene_path_on_a_swath(swath):
+    """The same on a swath, where the residual is block-constant to compare exactly.
+
+    Smoothed, the bundle masks its residual back to the observed footprint and
+    sharpen() does not, so they differ where no swath cell is; that is the
+    smoothed residual's own business, tested above.
+    """
+    features, target, grid_map = swath
+    make = lambda: _windowed(grid_map, smooth=False, window_size=4)
+
+    cube = _windowed_cube(features, [target], make)
+
+    assert make().fit(features, target)._has_local_models()
+    expected = make().sharpen(features, target).compute()
+    np.testing.assert_allclose(
+        cube.isel(time=0).values, expected.values, rtol=1e-9, atol=1e-6,
+    )
+
+
+def test_moving_windows_change_the_scene(varying_scene):
+    """Not a no-op: the local models move a scene whose relationship varies."""
+    features, target, _, _ = varying_scene
+    fine = features.to_dataset("band")
+    windowed = _windowed_cube(fine, [target], lambda: _windowed())
+    plain = _windowed_cube(fine, [target], lambda: _windowed(window_size=0))
+    assert np.nanmean(np.abs(windowed.values - plain.values)) > 0.05

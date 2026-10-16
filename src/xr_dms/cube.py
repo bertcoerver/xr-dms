@@ -22,7 +22,9 @@ many scenes are in it. The split is the one DMS already has:
   scene at once. With ``smooth_residual=False`` the middle step is a gather
   through a label array; with ``smooth_residual=True`` the bundle has already
   smoothed and interpolated the residual, so there is nothing left to do but
-  rechunk it.
+  rechunk it. With moving windows (``window_size > 0``) the bundle also fits
+  the local models and hands back the whole correction to the global first
+  guess on the fine grid, so the fine half stays the same three layers.
 
 The consequence worth knowing about is that the scene-global half is now opaque
 to the graph: the swath read happens inside the task, so nothing outside it needs
@@ -122,11 +124,6 @@ def sharpen_cube(sharpener, features, scene_args, bundle,
         computed: selecting a scene costs that scene's bundle and the blocks
         asked for.
     """
-    if sharpener.window_size > 0:
-        raise NotImplementedError(
-            "sharpen_cube does not support moving-window models "
-            "(window_size > 0); use Sharpener.sharpen()."
-        )
     import dask.array as dsa
 
     fine = sharpener._as_features(features, extra_dims=(time_dim,))
@@ -151,9 +148,10 @@ def sharpen_cube(sharpener, features, scene_args, bundle,
         )
 
     # Whether the bundle hands back labels to index the coarse residual with or
-    # the smoothed residual already on the fine grid; either way it is one
+    # a correction already on the fine grid (the smoothed residual, and with
+    # moving windows what the local models change too); either way it is one
     # fine-shaped array per scene, so only the dtype changes here.
-    smooth = sharpener.smooth_residual
+    smooth = sharpener.gathers_field
 
     ny, nx = fine.sizes[y_dim], fine.sizes[x_dim]
     gather, states, residual = bundled_arrays(

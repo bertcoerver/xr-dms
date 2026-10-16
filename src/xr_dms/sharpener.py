@@ -155,6 +155,19 @@ def _predict_block(arr, state, band_order):
     return out.reshape(spatial)
 
 
+def _fine_per_coarse(grid_map):
+    """Fine pixels along one side of a coarse cell, on average, from its labels.
+
+    The integer factor of a regular map; for a swath, the square root of the
+    fine pixels each observed cell holds. Only a block size is made of it.
+    """
+    labels = np.asarray(grid_map.labels)
+    claimed = labels[labels >= 0]
+    if claimed.size == 0:
+        return 1.0
+    return float(np.sqrt(claimed.size / np.unique(claimed).size))
+
+
 def to_radiance(temperature):
     """Convert temperature to radiance space (``T**4``).
 
@@ -825,21 +838,21 @@ class Sharpener:
           :meth:`_smoothed_residual_fine`). The pyDMS correction: gentle, only
           approximately conserving, and free of the coarse cell geometry.
 
+        With ``window_size > 0`` (Gao 2012 section 2.3) the local models are
+        trained here too, and ``gather`` is always a field on the fine grid: the
+        blended first guess less the global one, plus the residual against the
+        blend, in correction space (radiance when ``disaggregating_temperature``).
+        Added to the global first guess, which is all the caller predicts, that
+        is :meth:`sharpen`'s result. :attr:`gathers_field` says which form a
+        sharpener's ``gather`` takes.
+
         Either way the state's ``residual_coarse`` is raveled to 1-D. An
         unfittable scene comes back with ``global_model=None``, an all-NaN
         residual and a :attr:`SceneState.reason` rather than raising: by the time
         this runs the graph's shape is fixed, so the failure has to be a value.
         A scene whose fit succeeded but whose residual has no finite value is one
         of those too.
-
-        Requires ``window_size == 0``.
         """
-        if self.window_size > 0:
-            raise NotImplementedError(
-                "scene_bundle does not support moving-window models "
-                "(window_size > 0); use fit()."
-            )
-
         fine = self._as_features(features)
         band_order = [str(b) for b in fine[self.band_dim].values]
         self._setup_grid_map(fine, target)
@@ -864,9 +877,9 @@ class Sharpener:
 
         def unfitted(reason):
             # An unfittable scene's gather has to have the dtype the caller's
-            # graph declared for it, which follows smooth_residual either way.
+            # graph declared for it, which follows gathers_field either way.
             gather = (
-                np.full(labels.shape, np.nan) if self.smooth_residual else labels
+                np.full(labels.shape, np.nan) if self.gathers_field else labels
             )
             return gather, SceneState(
                 band_order=band_order,
@@ -881,6 +894,15 @@ class Sharpener:
         state = SceneState(band_order, model, threshold, n)
 
         guess = self.predict(fine, state=state)
+        global_guess = guess
+        if self.window_size > 0:
+            guess = global_guess = guess.compute()
+            blended = pure._local_first_guess(
+                mean_arr, y_arr, cv_arr, fine, global_guess, prepared, model,
+                band_order,
+            )
+            if blended is not None:
+                guess = blended
         guess_r = to_radiance(guess) if self.disaggregating_temperature else guess
         obs = to_radiance(prepared) if self.disaggregating_temperature else prepared
         # Computed once here: the smoothing, the footprint mask and the state
@@ -912,8 +934,59 @@ class Sharpener:
             if self.smooth_residual else labels
         )
         residual = np.asarray(residual.values, dtype=float).ravel()
+        if self.window_size > 0:
+            # The fine correction to the global first guess: what the local
+            # models change, and the residual against the blend they make.
+            if not self.smooth_residual:
+                gather = np.append(residual, np.nan)[labels]
+            radiance = to_radiance if self.disaggregating_temperature else (lambda v: v)
+            gather = (
+                np.asarray(radiance(guess).values, dtype=float)
+                - np.asarray(radiance(global_guess).values, dtype=float)
+                + gather
+            )
 
         return gather, replace(state, residual_coarse=residual)
+
+    def _local_first_guess(self, mean_arr, y_arr, cv_arr, fine, global_guess,
+                           target, model, band_order):
+        """The moving-window first guess of one scene, blended with the global.
+
+        :meth:`fit`'s local half and :meth:`first_guess`'s blend, on a sharpener
+        already seeded for the scene (``self`` is :meth:`scene_bundle`'s
+        ``pure``) and fitted to ``model``. ``None`` when no window got a model of
+        its own, which leaves the global guess as it is.
+
+        Computed here, one thread: the blocks are about a window each, so a
+        block meets the few models whose windows touch it rather than every
+        model predicting the whole scene, and the threads of the caller's graph
+        are left alone.
+        """
+        import dask
+
+        self.band_order_ = list(band_order)
+        self.global_model_ = model
+        self.fitted_ = True
+        self._train_local_models(mean_arr, y_arr, cv_arr, fine)
+        if not self._has_local_models():
+            return None
+        per = getattr(self.grid_map_, "factor", None) or _fine_per_coarse(
+            self.grid_map_)
+        block = max(64, int(round(per * self.window_size)))
+        blocks = fine.chunk({self.y_dim: block, self.x_dim: block})
+        with dask.config.set(scheduler="synchronous"):
+            local = self.predict_local(blocks).compute()
+            return self._blend_local_global(local, global_guess, target).compute()
+
+    @property
+    def gathers_field(self):
+        """Whether :meth:`scene_bundle`'s ``gather`` is a field on the fine grid.
+
+        A label array (an index into the coarse residual) only for the plain
+        global model with a block-constant residual; a fine-grid correction
+        otherwise. :func:`~xr_dms.cube.sharpen_cube` declares its dtype by this.
+        """
+        return self.smooth_residual or self.window_size > 0
 
     def sharpen(self, features, target, lazy=False):
         """Fit, predict and residual-correct in one call (steps 1-5).
